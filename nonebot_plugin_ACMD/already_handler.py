@@ -1,22 +1,48 @@
 from abc import abstractmethod
-from typing import Union, Optional, Any, Callable, Type, Coroutine
+from typing import Callable, Type, Coroutine, Union, Optional, Any
+from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, PrivateMessageEvent
 import inspect
-from .command_signer import BasicHandler
+import os
+from .command_signer import BasicHandler, SingletonABCMeta
 
 
 class MessageHandler(BasicHandler):
-    __slots__ = BasicHandler.__slots__
+    __slots__ = tuple(
+        slot for slot in BasicHandler.__slots__ if slot != '__weakref__')
 
     @abstractmethod
-    async def handle(self, bot=None, event=None, msg=None, qq=None, groupid=None, image=None, **kwargs):
+    async def handle(self, bot: Bot = None, event: Union[GroupMessageEvent, PrivateMessageEvent] = None, msg: str = None, qq: str = None, groupid: str = None, image: Optional[str] = None, ** kwargs: Any) -> None:
+        """处理接收到的消息。
+
+        参数:
+            bot (Bot): 机器人实例
+            event (Union[GroupMessageEvent, PrivateMessageEvent]): 消息事件
+            msg (str): 处理后的消息文本
+            qq (str): 发送者的QQ号
+            groupid (str): 群组ID（私聊时为 -1 ）
+            image (Optional[str]): 图片URL（如果有,且最多一张）
+            **kwargs (BasicHandler): 其他关键字参数
+        """
         pass
 
 
 class GroupMessageHandler(BasicHandler):
-    __slots__ = BasicHandler.__slots__
+    __slots__ = tuple(
+        slot for slot in BasicHandler.__slots__ if slot != '__weakref__')
 
     @abstractmethod
-    async def handle(self, bot=None, event=None, msg=None, qq=None, groupid=None, image=None, **kwargs):
+    async def handle(self, bot: Bot = None, event: GroupMessageEvent = None, msg: str = None, qq: str = None, groupid: str = None, image: Optional[str] = None, ** kwargs: Any) -> None:
+        """处理接收到的消息。
+
+        参数:
+            bot (Bot): 机器人实例
+            event (Union[GroupMessageEvent, PrivateMessageEvent]): 消息事件
+            msg (str): 处理后的消息文本
+            qq (str): 发送者的QQ号
+            groupid (str): 群组ID（私聊时为 -1 ）
+            image (Optional[str]): 图片URL（如果有,且最多一张）
+            **kwargs (BasicHandler): 其他关键字参数
+        """
         pass
 
     async def should_handle(self, **kwargs):
@@ -27,10 +53,22 @@ class GroupMessageHandler(BasicHandler):
 
 
 class PrivateMessageHandler(BasicHandler):
-    __slots__ = BasicHandler.__slots__
+    __slots__ = tuple(
+        slot for slot in BasicHandler.__slots__ if slot != '__weakref__')
 
     @abstractmethod
-    async def handle(self, bot=None, event=None, msg=None, qq=None, groupid=None, image=None, **kwargs):
+    async def handle(self, bot: Bot = None, event:  PrivateMessageEvent = None, msg: str = None, qq: str = None, groupid: str = None, image: Optional[str] = None, ** kwargs: Any) -> None:
+        """处理接收到的消息。
+
+        参数:
+            bot (Bot): 机器人实例
+            event (Union[GroupMessageEvent, PrivateMessageEvent]): 消息事件
+            msg (str): 处理后的消息文本
+            qq (str): 发送者的QQ号
+            groupid (str): 群组ID（私聊时为 -1 ）
+            image (Optional[str]): 图片URL（如果有,且最多一张）
+            **kwargs (BasicHandler): 其他关键字参数
+        """
         pass
 
     async def should_handle(self, **kwargs):
@@ -58,7 +96,6 @@ class func_to_Handler:
         """
         装饰器，将一个异步函数转换为指定类型的处理器实例。
 
-        :param handler_class: 处理器类，如 MessageHandler, GroupMessageHandler, PrivateMessageHandler
         :param block: 是否阻塞，默认为 True
         :param unique: 唯一标识符，默认为 None
         :return: 装饰器函数
@@ -92,16 +129,30 @@ class func_to_Handler:
         def decorator(func: Callable[..., Coroutine]) -> BasicHandler:
             if not inspect.iscoroutinefunction(func):
                 raise TypeError(f"传入的函数 {func.__name__} 必须是异步函数")
+
+            # 获取调用者的包的绝对路径
+            caller_frame = inspect.stack()[1]
+            caller_filename = caller_frame.filename
+            script_folder_path = os.path.abspath(
+                os.path.dirname(caller_filename))
+
+            def __init__(self):
+                super(self.__class__, self).__init__(block=block,
+                                                     unique=unique, script_folder_path=script_folder_path)
+
+            # 动态创建处理器类
             DynamicHandler = type(
                 func.__name__,
                 (handler_class,),
                 {
-                    '__slots__': handler_class.__slots__,
-                    '__init__': lambda self: handler_class.__init__(self, block=block, unique=unique),
+                    '__slots__': tuple(slot for slot in handler_class.__slots__ if slot != '__weakref__'),
+                    '__init__': __init__,
                     'handle': cls._create_handle_method(func)
-                }
+                },
             )
-            return DynamicHandler()
+
+            return DynamicHandler(script_folder_path=script_folder_path)
+
         return decorator
 
     @staticmethod

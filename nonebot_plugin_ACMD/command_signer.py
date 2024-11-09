@@ -3,28 +3,49 @@ from typing import Any, Optional, Union
 from abc import ABC, abstractmethod, ABCMeta
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, PrivateMessageEvent
 from nonebot import logger
+from typing import Any, Optional
+import inspect
+import os
+from weakref import WeakValueDictionary
+from collections import defaultdict
 
 
 class SingletonABCMeta(ABCMeta):
-    _instances = {}
+    _instances: WeakValueDictionary = WeakValueDictionary()
     _lock: threading.Lock = threading.Lock()
+    _path_instances: defaultdict = defaultdict(WeakValueDictionary)
 
     def __call__(cls, *args, **kwargs):
         if cls not in cls._instances:
             with cls._lock:
                 if cls not in cls._instances:
+                    # 获取创建实例的脚本文件夹的绝对路径
+                    if 'script_folder_path' not in kwargs:
+                        caller_frame = inspect.stack()[1]
+                        caller_filename = caller_frame.filename
+                        script_folder_path = os.path.abspath(
+                            os.path.dirname(caller_filename))
+                    else:
+                        script_folder_path = kwargs.pop('script_folder_path')
+
+                    # 创建实例
                     instance = super(SingletonABCMeta, cls).__call__(
                         *args, **kwargs)
                     cls._instances[cls] = instance
+
+                    # 将实例的弱引用添加到路径实例字典中
+                    cls._path_instances[script_folder_path][instance] = instance
+
+                    # 日志记录
                     if not isinstance(instance, BasicHandler):
                         logger.warning(
-                            f'实例 {instance} 不是 BasicHandler 子类,这很可能会导致未知错误')
-                    instance: BasicHandler
+                            f'实例 {instance} 不是 BasicHandler 子类, 这很可能会导致未知错误')
                     try:
                         logger.info(f'成功注册处理ID为 {instance.handler_id} 的实例 {
                                     str(instance)}')
                     except AttributeError:
                         logger.info(f'成功注册处理实例 {instance}')
+
         return cls._instances[cls]
 
 
@@ -49,9 +70,9 @@ class BasicHandler(ABC, metaclass=SingletonABCMeta):
         - should_handle 异步  该处理器是否应当执行 , 必须返回bool
         - should_block 异步  该处理器是否阻断传播 , 必须返回bool
     """
-    __slots__=['block','_handler_id','unique']
+    __slots__ = ('block', '_handler_id', 'unique', '__weakref__')
 
-    def __init__(self, block: bool = True, unique: str = None):
+    def __init__(self, block: bool = True, unique: str = None, **kwargs):
         self.block = block
         self._handler_id: int = HandlerManager.get_id(self)
         self.unique = unique
@@ -96,6 +117,13 @@ class BasicHandler(ABC, metaclass=SingletonABCMeta):
     def handler_id(self) -> int:
         return self._handler_id
 
+    def remove(self):
+        HandlerManager.remove_handler(self)
+        with SingletonABCMeta._lock:
+            if type(self) in SingletonABCMeta._instances and SingletonABCMeta._instances[type(self)] is self:
+                del SingletonABCMeta._instances[type(self)]
+
+
     def __str__(self):
         if self.unique:
             return f'{self.unique}'
@@ -135,8 +163,7 @@ class HandlerManager:
             if handler in cls._handler_to_id:
                 handler_id = cls._handler_to_id.pop(handler)
                 del cls._id_to_handler[handler_id]
-                return True
-            return False
+                logger.info(f'处理ID为  {handler_id}  的实例  {str(handler)}  已注销')
 
 
 if __name__ == '__main__':

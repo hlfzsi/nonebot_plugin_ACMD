@@ -1,12 +1,17 @@
 import sqlite3
 from nonebot import logger
+import aiosqlite
 import pandas as pd
+import threading
 from .connection_pool import SQLitePool
 from nonebot.exception import StopPropagation
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, PrivateMessageEvent
 from typing import List, Union, Any, Optional, Dict, Callable
 import asyncio
-from collections import Counter
+from collections import Counter, defaultdict
+import os
+import inspect
+from weakref import WeakValueDictionary
 
 SHARED_MEMORY_DB_NAME = "file:shared_memory_db?mode=memory&cache=shared"
 MEMORY_DB_CONN = sqlite3.connect(SHARED_MEMORY_DB_NAME, uri=True)
@@ -62,7 +67,7 @@ class CommandData:
 class CommandDatabase:
     """数据库操作类，用于命令的增删改查。"""
 
-    def __init__(self, db_connection: sqlite3.Connection = None):
+    def __init__(self, db_connection: Union[sqlite3.Connection, aiosqlite.Connection] = None):
         self.conn = db_connection
 
     def insert_commands(self, command_data: CommandData):
@@ -73,6 +78,15 @@ class CommandDatabase:
             VALUES (?, ?, ?, ?, ?)
         ''', [(cmd, command_data.description, command_data.owner, command_data.full_match, ','.join(command_data.handler_list)) for cmd in command_data.command])
         self.conn.commit()
+
+    async def _aioinsert_commands(self, command_data: CommandData):
+        """插入命令到数据库。"""
+        async with self.conn.cursor() as cursor:
+            await cursor.executemany('''
+                INSERT INTO commands (command, description, owner, full_match, handler_list)
+                VALUES (?, ?, ?, ?, ?)
+            ''', [(cmd, command_data.description, command_data.owner, command_data.full_match, ','.join(command_data.handler_list)) for cmd in command_data.command])
+        await self.conn.commit()
 
     async def update_commands(self, command_data: CommandData):
         """更新命令到数据库。"""
@@ -106,9 +120,12 @@ class CommandDatabase:
 
 
 class Command:
-    """命令类。"""
+    # 类属性，用于存储命令实例
+    _commands_dict: defaultdict = defaultdict(WeakValueDictionary)
+    _lock: threading.Lock = threading.Lock()
 
-    def __init__(self, commands: List[str], description: str, owner: str, full_match: bool, handler_list: List[Union[str, BasicHandler]]):
+    def __init__(self, commands: List[str], description: str, owner: str, full_match: bool, handler_list: List[Union[str, BasicHandler]], **kwargs):
+        # 初始化命令数据
         self.data = CommandData(
             command=list(dict.fromkeys([command.strip()
                          for command in commands])),
@@ -119,9 +136,33 @@ class Command:
                 handler, BasicHandler) else handler for handler in handler_list]
         )
 
+        # 获取脚本文件夹的绝对路径
+        if 'script_folder_path' not in kwargs:
+            caller_frame = inspect.stack()[1]
+            caller_filename = caller_frame.filename
+            script_folder_path = os.path.abspath(
+                os.path.dirname(caller_filename))
+        else:
+            script_folder_path = kwargs['script_folder_path']
+
+        # 将命令实例添加到类属性字典中
+        with self._lock:
+            self._commands_dict[script_folder_path][self] = self
+
         # 在初始化时进行验证和保存
         if self.validate():
-            self.save()
+            if not COMMAND_POOL._initialized:
+                self.save()
+            else:
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+
+                if loop and loop.is_running():
+                    loop.create_task(self._aiosave())
+                else:
+                    asyncio.run(self._aiosave())
 
     def validate(self) -> bool:
         """验证命令数据的合法性。"""
@@ -138,6 +179,14 @@ class Command:
         db = CommandDatabase(MEMORY_DB_CONN)
         db.insert_commands(self.data)
 
+    async def _aiosave(self):
+        """保存命令数据到数据库。"""
+        if not self.validate():
+            raise ValueError("Invalid command data.")
+        async with COMMAND_POOL.connection() as conn:
+            db = CommandDatabase(conn)
+            await db._aioinsert_commands(self.data)
+
     async def update(self, new_commands: List[str] = None, new_hander_list: List[Union[str, BasicHandler]] = None):
         db = CommandDatabase()
         if new_commands is not None:
@@ -153,10 +202,25 @@ class Command:
 
         await db.update_commands(self.data)
 
-    async def delete(self):
+    async def delete(self, script_folder_path: str = None):
         """删除该命令。"""
-        db = CommandDatabase()
-        await db.remove_commands(self.data.command)
+        async with COMMAND_POOL.connection() as conn:
+            db = CommandDatabase(conn)
+            await db.remove_commands(self.data.command)
+
+        # 从类属性字典中移除该命令实例
+        if not script_folder_path:
+            caller_frame = inspect.stack()[1]
+            caller_filename = caller_frame.filename
+            script_folder_path = os.path.abspath(
+                os.path.dirname(caller_filename))
+        with self._lock:
+            if self in self._commands_dict[script_folder_path]:
+                del self._commands_dict[script_folder_path][self]
+                logger.info(f'{self.data.owner} 下属的命令 {self.data.command} 被注销')
+            else:
+                logger.error(f'{self.data.owner} 下属的命令 {
+                             self.data.command} 未找到')
 
 
 class CommandFactory:
@@ -174,7 +238,10 @@ class CommandFactory:
         Returns:
             Command: 命令对象
         """
-        return Command(commands, description, owner, full_match, handler_list)
+        caller_frame = inspect.stack()[1]
+        caller_filename = caller_frame.filename
+        script_folder_path = os.path.abspath(os.path.dirname(caller_filename))
+        return Command(commands, description, owner, full_match, handler_list, script_folder_path=script_folder_path)
 
     @staticmethod
     def create_help_command(owner: str, help_text: str = '', function: Callable = None) -> None:
@@ -359,7 +426,8 @@ async def dispatch(
 
 
 class Helper(BasicHandler):
-    __slots__ = BasicHandler.__slots__
+    __slots__ = tuple(
+        slot for slot in BasicHandler.__slots__ if slot != '__weakref__')
 
     async def get_unique_owners(self):
         async with COMMAND_POOL.connection() as db:
