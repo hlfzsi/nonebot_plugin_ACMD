@@ -386,7 +386,7 @@ async def dispatch(
             max_similarity = df_commands['similarity'].max()
             best_match_rows = df_commands[df_commands['similarity']
                                           == max_similarity]
-            if len(best_match_rows) == 1 and max_similarity >= 0.55:
+            if len(best_match_rows) == 1 and max_similarity >= 0.35:
                 best_match_row = best_match_rows.iloc[0]
                 best_match = best_match_row['command']
                 best_match_handlers = best_match_row['handler_list'].split(',')

@@ -5,12 +5,14 @@ import os
 import aiofiles
 import sys
 import inspect
+import pickle
 from typing import Dict, Set, List, Optional
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
 from nonebot import logger
 from .command_signer import BasicHandler
 from .command import Command
+from .ACMD_driver import executor
 
 # 依赖跟踪器
 
@@ -71,17 +73,72 @@ class AsyncReloader(FileSystemEventHandler):
         relative_path = os.path.relpath(path, os.getcwd()).replace(os.sep, '.')
         return relative_path
 
+    async def _save_state(self, module_name: str, state):
+        state_file = f"{module_name}.state"
+        try:
+            async with aiofiles.open(state_file, 'wb') as f:
+                await f.write(pickle.dumps(state))
+            logger.info(f"State for {module_name} saved successfully.")
+        except Exception as e:
+            logger.error(f"Failed to save state for {module_name}: {e}")
+            raise
+
+    async def _load_state(self, module_name: str):
+        state_file = f"{module_name}.state"
+        if not os.path.exists(state_file):
+            logger.debug(f"No state file found for {module_name}.")
+            return None
+
+        try:
+            async with aiofiles.open(state_file, 'rb') as f:
+                content = await f.read()
+                state = pickle.loads(content)
+            logger.info(f"State for {module_name} loaded successfully.")
+            return state
+        except Exception as e:
+            logger.error(f"Failed to load state for {module_name}: {e}")
+            return None
+
     async def _reload_module(self, package_name: str) -> None:
-        # 处理依赖
-        dependent_modules = self._find_dependents(package_name)
-        await self._call_command_method('delete', dependent_modules)
-        self._call_handler_method('remove', dependent_modules)
+        # 保存当前状态
+        old_module = sys.modules.get(package_name)
+        if old_module and hasattr(old_module, '__state__'):
+            await self._save_state(package_name, old_module.__state__)
 
-        # 卸载模块
-        self._unload_module(package_name)
+        # 提取与当前重载模块相关的函数，并准备清理
+        cleanup_funcs = []
+        for func_key, call in list(executor.registered_functions.items()):
+            module_name, func_qualname = func_key
+            if module_name == package_name or module_name.startswith(f"{package_name}."):
+                call = executor.registered_functions.pop(func_key)
+                cleanup_funcs.append(asyncio.create_task(call.call(
+                ) if asyncio.iscoroutinefunction(call.func) else asyncio.to_thread(call.call)))
+                executor.on_end_functions.discard(call)
+        await asyncio.gather(*cleanup_funcs)
 
-        # 加载模块
-        await self._load_module(package_name, self.package_path)
+        try:
+            # 处理依赖...
+            dependent_modules = self._find_dependents(package_name)
+            await self._call_command_method('delete', dependent_modules)
+            self._call_handler_method('remove', dependent_modules)
+
+            # 卸载模块...
+            self._unload_module(package_name)
+
+            # 加载新模块...
+            await self._load_module(package_name, self.package_path)
+
+            # 恢复状态...
+            new_module = sys.modules[package_name]
+            new_module.__state__ = await self._load_state(package_name)
+
+        except Exception as e:
+            logger.error(f"Failed to reload package {package_name}: {e}")
+            # 回滚到旧版本
+            if old_module is not None:
+                sys.modules[package_name] = old_module
+                old_module.__state__ = await self._load_state(package_name)
+            raise e
 
     def _find_dependents(self, package_name: str) -> List[str]:
         # 获取依赖模块的绝对路径
@@ -119,11 +176,8 @@ class AsyncReloader(FileSystemEventHandler):
                 getattr(handler, f"{method}")()
 
     def _unload_module(self, package_name: str) -> None:
-            # 创建一个列表，包含所有待卸载模块的名称
         modules_to_unload = [name for name in sys.modules if name ==
-                            package_name or name.startswith(package_name + '.')]
-
-        # 遍历列表，从sys.modules中移除这些模块
+                             package_name or name.startswith(package_name + '.')]
         for name in modules_to_unload:
             del sys.modules[name]
 
@@ -132,13 +186,14 @@ class AsyncReloader(FileSystemEventHandler):
         if not os.path.exists(init_file):
             return
 
+        # 异步读取文件内容
         async with aiofiles.open(init_file, mode='rb') as file:
             content = await file.read()
-            content = content.replace(b'\x00', b'')
+        content = content.replace(b'\x00', b'')
 
         # 动态加载模块
         spec = importlib.util.spec_from_file_location(package_name, init_file)
-        if spec is None:
+        if spec is None or spec.loader is None:
             raise ImportError(
                 f"Module {package_name} not found at {package_path}")
 
@@ -146,7 +201,7 @@ class AsyncReloader(FileSystemEventHandler):
         sys.modules[package_name] = module
 
         try:
-            await asyncio.to_thread(spec.loader.exec_module, module)
+            spec.loader.exec_module(module)
         except SyntaxError as e:
             logger.error(f"Syntax error while loading module {
                          package_name}: {e}")
