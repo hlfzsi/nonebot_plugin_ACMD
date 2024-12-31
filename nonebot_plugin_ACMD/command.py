@@ -4,6 +4,7 @@ import aiosqlite
 import pandas as pd
 import threading
 from .connection_pool import SQLitePool
+from .similarity import similarity_for_df
 from nonebot.exception import StopPropagation
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, PrivateMessageEvent
 from typing import List, Union, Any, Optional, Dict, Callable
@@ -369,40 +370,41 @@ async def dispatch(
 
         matches = df_commands[(~df_commands['full_match']) & (
             df_commands['command'] == df_commands['message_n_plus_1_space_content'])]
+
+        # 计算相似度
         if not matches.empty:
             best_match = matches.iloc[0]['command']
             best_match_handlers = matches.iloc[0]['handler_list'].split(',')
             exact_match = True
-
-        # 计算相似度
-        if not df_commands.empty and not exact_match:
-            df_commands['similarity'] = df_commands.apply(
-                lambda row: _ngram_similarity(
-                    row['message_n_plus_1_space_content'], row['command'])
-                if row['command_spaces'] + 1 <= len(message_split) else 0.0, axis=1
-            )
+        else:
+            df_commands.drop(
+                columns=['message_n_plus_1_space_content'], inplace=True)
+            # 使用新的相似度函数计算相似度
+            df_with_similarity = similarity_for_df(df_commands, message)
 
             # 找到相似度最高的行
-            max_similarity = df_commands['similarity'].max()
-            best_match_rows = df_commands[df_commands['similarity']
-                                          == max_similarity]
-            if len(best_match_rows) == 1 and max_similarity >= 0.35:
+            max_similarity = df_with_similarity['similarity'].max()
+            best_match_rows = df_with_similarity[df_with_similarity['similarity']
+                                                 == max_similarity]
+            if len(best_match_rows) == 1 and max_similarity >= 0.86:  # 调整相似度阈值
                 best_match_row = best_match_rows.iloc[0]
                 best_match = best_match_row['command']
                 best_match_handlers = best_match_row['handler_list'].split(',')
                 highest_similarity = best_match_row['similarity']
-                logger.debug(f"相似度最高的命令是：{best_match_rows.iloc[0]['command']}, 相似度为：{
+                logger.debug(f"相似度最高的命令是：{best_match}, 相似度为：{max_similarity}")
+            elif len(best_match_rows) >= 1 and max_similarity >= 0.86:
+                logger.debug(f"{best_match_rows}找到过多足够相似的命令。最高相似度为：{
                              max_similarity}")
+                return
             else:
-                logger.debug(f"相似度最高的命令是：{best_match_rows.iloc[0]['command']}, 相似度为：{
-                             max_similarity}")
+                logger.debug(f"未找到足够相似的命令。最高相似度为：{max_similarity}")
                 return
 
     # 确保字符数差异符合要求
     if best_match:
         command_full_match = df_commands[df_commands['command']
                                          == best_match]['full_match'].iloc[0]
-        if command_full_match and abs(len(message) - len(best_match)) >= 1:
+        if command_full_match and abs(len(message) - len(best_match)) >= 4:
             return
 
         # 替换消息内容

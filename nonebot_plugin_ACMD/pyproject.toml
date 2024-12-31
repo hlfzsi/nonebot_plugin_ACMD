@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "nonebot_plugin_ACMD"
+version = "0.0.1"
+description = "一个专注于解决输入问题的命令实现。"
+authors = ["hlfzsi"]
+license = "AGPL-3.0"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+aiosqlite = "^0.20.0"
+numba = "^0.60.0"
+pandas = "^2.2.3"
+watchdog = "^6.0.0"
+nonebot2 = "^2.4.1"
+nonebot-adapter-onebot = "^2.4.6"
+aiofiles = "^24.1.0"
+pypinyin = "^0.53.0"
+scipy = "^1.14.1"
+
+
+[[tool.poetry.source]]
+name = "tsinghua"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+priority = "default"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

@@ -3,7 +3,7 @@ from typing import Callable, Type, Coroutine, Union, Optional, Any
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, PrivateMessageEvent
 import inspect
 import os
-from .command_signer import BasicHandler, SingletonABCMeta
+from .command_signer import BasicHandler
 
 
 class MessageHandler(BasicHandler):

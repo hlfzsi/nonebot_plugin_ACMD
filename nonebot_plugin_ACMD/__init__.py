@@ -6,16 +6,32 @@ from typing import Union
 import time
 import asyncio
 driver = get_driver()
+__version__="0.0.1"
 
-from .command import dispatch, CommandFactory, Command, CommandData
-from .already_handler import GroupMessageHandler, PrivateMessageHandler, MessageHandler, func_to_Handler
+from .command import CommandFactory, Command, CommandData
+from .command import dispatch as _dispatch
+from .already_handler import func_to_Handler
 from .command_signer import BasicHandler
-from .auto_reload import HotSigner, HotPlugin, AsyncReloader
+from .auto_reload import HotSigner, HotPlugin
 from .ACMD_driver import get_driver as ACMD_get_driver
+from .similarity import similarity as _similarity
 rule = is_type(PrivateMessageEvent, GroupMessageEvent)
 total_process = on_message(rule=rule, priority=2, block=False)
 CommandFactory.create_help_command(owner='origin', help_text='')
+YELLOW = '\033[93m'
+ENDC = '\033[0m'
+print(rf"""{YELLOW}
+                       _   _                       _____ __  __ _____
+     /\               | | | |                     / ____|  \/  |  __ \
+    /  \   _ __   ___ | |_| |__   ___ _ __       | |    | \  / | |  | |
+   / /\ \ | '_ \ / _ \| __| '_ \ / _ | '__|      | |    | |\/| | |  | |
+  / ____ \| | | | (_) | |_| | | |  __| |         | |____| |  | | |__| |
+ /_/    \_|_| |_|\___/ \__|_| |_|\___|_|          \_____|_|  |_|_____/
 
+{ENDC}""")
+logger.info("ACMD is initializing... please wait")
+_similarity("hello","world")
+del ENDC,YELLOW
 
 @driver.on_startup
 async def abcstart():
@@ -35,7 +51,7 @@ async def total_stage(bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEv
             break
     try:
         start = time.time()
-        await dispatch(message=msg, bot=bot, event=event, image=image)
+        await _dispatch(message=msg, bot=bot, event=event, image=image)
     except StopPropagation:
         raise
     finally:
