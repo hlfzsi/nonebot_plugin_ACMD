@@ -22,7 +22,7 @@ scipy = "^1.14.1"
 [[tool.poetry.source]]
 name = "tsinghua"
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
-priority = "default"
+priority = "primary"
 
 [build-system]
 requires = ["poetry-core"]
