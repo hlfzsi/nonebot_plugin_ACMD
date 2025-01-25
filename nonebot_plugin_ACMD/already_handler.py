@@ -1,11 +1,10 @@
 import inspect
-from functools import update_wrapper, partial
+from functools import update_wrapper
 import os
-import types
 
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, PrivateMessageEvent
 
-from typing import Callable, Dict, Type, Coroutine, Union, Any, get_type_hints
+from typing import Callable, Type, Coroutine, Union, get_type_hints
 
 from abc import abstractmethod
 

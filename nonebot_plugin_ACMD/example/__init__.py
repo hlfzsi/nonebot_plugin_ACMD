@@ -3,7 +3,9 @@ from nonebot.adapters.onebot.v11 import GroupMessageEvent, PrivateMessageEvent, 
 from typing import Union
 import asyncio
 
-from nonebot_plugin_ACMD import ACMD_get_driver, HotSigner, CommandFactory, func_to_Handler, PrivateMessageHandler, BasicHandler
+from nonebot_plugin_ACMD import ACMD_get_driver, HotSigner, CommandFactory, func_to_Handler, BasicHandler
+from nonebot_plugin_ACMD.Atypes import Bot,MessageEvent,Record
+
 
 driver = ACMD_get_driver()
 HotSigner.add_plugin()  # 添加热重载支持
@@ -20,26 +22,27 @@ async def greet():
 @func_to_Handler.all_message_handler()
 # 通过变量名进行注入
 async def test(bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent]):
-    await bot.send(event, 'Hello,world!')
+    await bot.send(event, f'Hello,world!')
     # pass or do something...
 
 
-class MYHandler(PrivateMessageHandler):
-    # 这里类型标注省略，实际开发中强烈建议添加类型标注，它可以在BasicHandler中找到示例
-    async def handle(self, bot=None, event=None, msg=None, qq=None, groupid=None, image=None, **kwargs):
+class MYHandler(BasicHandler):
+    # 实际开发中必须添加类型标注，它可以在BasicHandler中找到示例
+    async def handle(self, bot:Bot, event:MessageEvent,record:Record):
         # Do something...
+        si=record.similarity
+        await bot.send(event, f'Hello,world!\n相似度为 {si}')
         return
 
 
 # 进行命令和处理器的绑定
 my_first_cmd = CommandFactory.create_command(
-    ['hello', 'hi'], [test, MYHandler()], owner='test')   # 保留你的cmd对象，它可以被动态修改
-asyncio.run(my_first_cmd.delete())  # 撤销我的指令
-# 注意，cmd对象的大部分操作需要 await
+    # 保留你的cmd对象，它可以被动态修改
+    ['hello', 'hi', 'world', '/love', '/test', '/this is a demo','234234234','222','hhh'], [test,MYHandler(block=True)], owner='test')
 
 
 @driver.on_shutdown
 async def end():
     logger.debug('ending...')
     # Do some cleaning...
-    await asyncio.sleep(3)
+    await asyncio.sleep(1)

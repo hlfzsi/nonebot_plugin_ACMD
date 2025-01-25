@@ -5,7 +5,7 @@ import threading
 from collections import defaultdict
 from weakref import WeakValueDictionary
 
-from typing import Any, Optional, Union
+from typing import Optional, Union
 
 from abc import ABC, abstractmethod, ABCMeta
 
