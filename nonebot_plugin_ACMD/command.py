@@ -1,22 +1,32 @@
-import sqlite3
-from nonebot import logger
-import aiosqlite
-import pandas as pd
-import threading
-from .connection_pool import SQLitePool
-from .similarity import similarity_for_df
-from nonebot.exception import StopPropagation
-from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, PrivateMessageEvent
-from typing import List, Union, Any, Optional, Dict, Callable
-import asyncio
-from collections import Counter, defaultdict
 import os
 import inspect
+from collections import defaultdict
 from weakref import WeakValueDictionary
+import threading
+import asyncio
 
-SHARED_MEMORY_DB_NAME = "file:shared_memory_db?mode=memory&cache=shared"
-MEMORY_DB_CONN = sqlite3.connect(SHARED_MEMORY_DB_NAME, uri=True)
-COMMAND_POOL = SQLitePool(shared_uri=SHARED_MEMORY_DB_NAME)
+import sqlite3
+import aiosqlite
+import pandas as pd
+from rapidfuzz import fuzz
+from typing import Awaitable, List, Union, Any, Optional, Dict, Callable, Final
+
+from nonebot import logger
+from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, PrivateMessageEvent
+from .connection_pool import SQLitePool
+from .cli import CommandRegistry
+from .Atypes import HandlerInvoker, HandlerContext
+from .Atypes import (
+    UserInput,
+    GroupID,
+    ImageInput,
+    PIN,
+    Record
+)
+
+SHARED_MEMORY_DB_NAME: Final = "file:shared_memory_db?mode=memory&cache=shared"
+MEMORY_DB_CONN: Final = sqlite3.connect(SHARED_MEMORY_DB_NAME, uri=True)
+COMMAND_POOL: Final = SQLitePool(shared_uri=SHARED_MEMORY_DB_NAME)
 
 from .command_signer import BasicHandler  # noqa
 
@@ -31,7 +41,7 @@ def create_memory_table():
             description TEXT,
             owner TEXT,
             full_match INTEGER,
-            handler_list TEXT  -- 使用逗号分隔的字符串来存储多个 Handler 的 ID
+            handler_list TEXT
         )
     ''')
     # 创建 helps 表
@@ -56,6 +66,8 @@ create_memory_table()
 
 class CommandData:
     """数据模型类，用于存储命令的属性。"""
+    __slots__ = ('command', 'description', 'owner',
+                 'full_match', 'handler_list')
 
     def __init__(self, command: List[str], description: str, owner: str, full_match: bool, handler_list: List[str]):
         self.command = command
@@ -67,6 +79,7 @@ class CommandData:
 
 class CommandDatabase:
     """数据库操作类，用于命令的增删改查。"""
+    __slots__ = ('conn')
 
     def __init__(self, db_connection: Union[sqlite3.Connection, aiosqlite.Connection] = None):
         self.conn = db_connection
@@ -124,6 +137,7 @@ class Command:
     # 类属性，用于存储命令实例
     _commands_dict: defaultdict = defaultdict(WeakValueDictionary)
     _lock: threading.Lock = threading.Lock()
+    __slots__ = ('data', '__weakref__')
 
     def __init__(self, commands: List[str], description: str, owner: str, full_match: bool, handler_list: List[Union[str, BasicHandler]], **kwargs):
         # 初始化命令数据
@@ -257,6 +271,23 @@ class CommandFactory:
         """
         HelpTakeOverManager.takeover_help(owner, help_text, function)
 
+    @staticmethod
+    def CLI_cmd_register(cmd: str) -> Callable:
+        """
+        装饰器,用于注册控制台指令。
+
+        非常建议详细撰写被装饰函数的文档字符串,因为它会被展示给用户
+
+        参数:
+            cmd (str): 要注册的命令名称。
+        返回:
+            Callable: 一个装饰器，用来装饰实现命令逻辑的异步函数。
+        """
+        def decorator(func: Callable[..., Awaitable[None]]) -> Callable[..., Awaitable[None]]:
+            CommandRegistry.register(cmd)(func)
+            return func
+        return decorator
+
 
 class HelpTakeOverManager:
     """帮助接管管理器。"""
@@ -298,26 +329,24 @@ class HelpTakeOverManager:
             return cls._owner_to_function[owner]
 
 
-def _ngram_similarity(s1: str, s2: str, n: int = 2) -> float:
-    """计算两个字符串之间的n-gram相似度。"""
-    grams1 = Counter(_ngrams(s1.lower(), n))
-    grams2 = Counter(_ngrams(s2.lower(), n))
-    intersection = grams1 & grams2
-    union = grams1 | grams2
-    return sum(intersection.values()) / sum(union.values()) if union else 0.0
+def _fuzzy_match_ratio(s1: str, s2: str) -> float:
+    """计算两个字符串之间的模糊匹配相似度分数。
 
+    参数:
+    s1 : 用户输入
+    s2 : 标准命令
 
-def _ngrams(text: str, n: int = 2) -> List[str]:
-    """从给定文本生成n-gram计数。"""
-    return [text[i:i+n] for i in range(len(text)-n+1)]
+    返回:
+    模糊匹配相似度分数，范围从0到100
+    """
+    return fuzz.WRatio(s1, s2)
 
 
 async def dispatch(
     message: str,
     bot: Bot,
     event: Union[GroupMessageEvent, PrivateMessageEvent],
-    image: Optional[str] = None,
-    private_vars: Optional[Dict[str, Any]] = None
+    image: List[str] = [],
 ) -> None:
     """消息派发，执行对应逻辑"""
 
@@ -347,12 +376,12 @@ async def dispatch(
 
     df_commands = pd.DataFrame(
         commands, columns=['command', 'handler_list', 'full_match'])
-    best_match, best_match_handlers, exact_match, highest_similarity = None, [], False, 0.0
+    best_match, best_match_handlers, exact_match, highest_similarity = '', [], False, 0.0
 
     # 检查完全匹配
     exact_matches = df_commands[df_commands['command'] == message]
     if not exact_matches.empty:
-        best_match = exact_matches.iloc[0]['command']
+        best_match: str = exact_matches.iloc[0]['command']
         best_match_handlers = exact_matches.iloc[0]['handler_list'].split(',')
         exact_match = True
     else:
@@ -370,41 +399,40 @@ async def dispatch(
 
         matches = df_commands[(~df_commands['full_match']) & (
             df_commands['command'] == df_commands['message_n_plus_1_space_content'])]
-
-        # 计算相似度
         if not matches.empty:
-            best_match = matches.iloc[0]['command']
+            best_match: str = matches.iloc[0]['command']
             best_match_handlers = matches.iloc[0]['handler_list'].split(',')
             exact_match = True
-        else:
-            df_commands.drop(
-                columns=['message_n_plus_1_space_content'], inplace=True)
-            # 使用新的相似度函数计算相似度
-            df_with_similarity = similarity_for_df(df_commands, message)
+
+        # 计算相似度
+        if not df_commands.empty and not exact_match:
+            df_commands['similarity'] = df_commands.apply(
+                lambda row: _fuzzy_match_ratio(
+                    row['message_n_plus_1_space_content'], row['command'])
+                if row['command_spaces'] + 1 <= len(message_split) else 0.0, axis=1
+            )
 
             # 找到相似度最高的行
-            max_similarity = df_with_similarity['similarity'].max()
-            best_match_rows = df_with_similarity[df_with_similarity['similarity']
-                                                 == max_similarity]
-            if len(best_match_rows) == 1 and max_similarity >= 0.86:  # 调整相似度阈值
+            max_similarity = df_commands['similarity'].max()
+            best_match_rows = df_commands[df_commands['similarity']
+                                          == max_similarity]
+            if len(best_match_rows) == 1 and max_similarity >= 65:
                 best_match_row = best_match_rows.iloc[0]
-                best_match = best_match_row['command']
+                best_match: str = best_match_row['command']
                 best_match_handlers = best_match_row['handler_list'].split(',')
                 highest_similarity = best_match_row['similarity']
-                logger.debug(f"相似度最高的命令是：{best_match}, 相似度为：{max_similarity}")
-            elif len(best_match_rows) >= 1 and max_similarity >= 0.86:
-                logger.debug(f"{best_match_rows}找到过多足够相似的命令。最高相似度为：{
+                logger.debug(f"相似度最高的命令是：{best_match_rows.iloc[0]['command']}, 相似度为：{
                              max_similarity}")
-                return
             else:
-                logger.debug(f"未找到足够相似的命令。最高相似度为：{max_similarity}")
+                logger.debug(f"相似度最高的命令是：{best_match_rows.iloc[0]['command']}, 相似度为：{
+                             max_similarity}")
                 return
 
     # 确保字符数差异符合要求
     if best_match:
         command_full_match = df_commands[df_commands['command']
                                          == best_match]['full_match'].iloc[0]
-        if command_full_match and abs(len(message) - len(best_match)) >= 4:
+        if command_full_match and abs(len(message) - len(best_match)) >= 1:
             return
 
         # 替换消息内容
@@ -415,16 +443,26 @@ async def dispatch(
                 message_parts[:command_spaces + 1] = best_match.split(' ')
                 message = ' '.join(message_parts)
 
+    best_match_handlers = [int(handle_id) for handle_id in best_match_handlers]
+
     # 继续执行处理程序
-    if best_match:
-        for handler_id in best_match_handlers:
-            handler = BasicHandler.get_handler_by_id(int(handler_id))
-            if handler:
-                if await handler.should_handle(msg=message, image=image, qq=str(event.user_id), groupid=groupid, bot=bot, event=event, highest_similarity=highest_similarity, best_match_handlers=best_match_handlers):
-                    asyncio.create_task(handler.handle(msg=message, image=image, qq=str(
-                        event.user_id), groupid=groupid, bot=bot, event=event, best_match_handlers=best_match_handlers, **(private_vars or {})))
-                    if await handler.should_block(msg=message, image=image, qq=str(event.user_id), groupid=groupid, bot=bot, event=event, highest_similarity=highest_similarity, best_match_handlers=best_match_handlers):
-                        raise StopPropagation
+    try:
+        if best_match:
+            handler_context = HandlerContext(
+                msg=UserInput(message.replace(
+                    best_match, '', 1).strip(), message),
+                image=ImageInput(image),
+                pin=PIN(str(event.user_id), event.avatar),
+                groupid=GroupID(groupid, int(groupid)),
+                bot=bot,
+                event=event,
+                record=Record(similarity=highest_similarity,
+                              handlers=best_match_handlers)
+            )
+            for handler in best_match_handlers:
+                await HandlerInvoker.invoke_handler(handler, handler_context)
+    finally:
+        pass
 
 
 class Helper(BasicHandler):
@@ -474,14 +512,19 @@ class Helper(BasicHandler):
                 else:
                     return []
 
-    async def handle(self, bot: Bot, event: GroupMessageEvent | PrivateMessageEvent, msg: str, qq: str, groupid: str, image: str | None, **kwargs: Any) -> None:
-        groups = msg.replace('/help ', '', 1).split(' ')
-        if not groups or msg == '/help':
+    async def handle(self, bot: Bot = None, event: Union[GroupMessageEvent, PrivateMessageEvent] = None, msg: UserInput = None, qq: PIN = None, groupid: GroupID = None, image: ImageInput = None) -> None:
+        groups = msg.full.replace('/help ', '', 1).split(' ')
+        if not groups or msg.full == '/help':
             msg_to_send = '\n'.join(await self.get_unique_owners())
+            await bot.send(event, message=f'可用模块:\n{msg_to_send}\n\n使用 /help [model] [page] 来查阅详情')
+            return
         else:
-            msg_to_send = await self.get_owner_help(groups[0], groups[1] if len(groups) == 2 else 1, bot=bot, event=event, msg=msg, qq=qq, groupid=groupid, image=image, extra_kwargs=kwargs)
-        if msg_to_send:
-            await bot.send(event=event, message=f'可用指令:\n{msg_to_send}')
+            msg_to_send = await self.get_owner_help(groups[0], groups[1] if len(groups) == 2 else 1, bot=bot, event=event, msg=msg, qq=qq, groupid=groupid, image=image)
+            if msg_to_send:
+                await bot.send(event=event, message=f'可用指令:\n{msg_to_send}\n\n使用 /help [model] [page] 来切换页码')
+                return
+            elif msg_to_send is not None:
+                await bot.send(event=event, message='当前页码为空\n使用 /help [model] [page] 来切换页码')
 
 
 CommandFactory.create_command(
@@ -490,14 +533,3 @@ CommandFactory.create_command(
     owner='origin',
     description='生成帮助文档'
 )
-
-if __name__ == '__main__':
-    class HandlerA(BasicHandler):
-        async def handle(self, bot: Bot, event: GroupMessageEvent | PrivateMessageEvent, msg: str, qq: str, groupid: str, image: str | None, **kwargs: Any) -> None:
-            print(f'{self.handler_id} and Handler is running')
-    CommandFactory.create_command(
-        ['/ChangeGtype', '/ChangeCtype'], 'test command', 'test', False, [HandlerA()])
-
-    async def test():
-        await dispatch('/Changetype 1', None, None)
-    asyncio.run(test())

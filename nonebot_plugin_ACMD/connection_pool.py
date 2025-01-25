@@ -5,6 +5,9 @@ from contextlib import asynccontextmanager
 
 
 class SQLitePool:
+    __slots__ = ('db_file', 'max_size', 'shared_uri',
+                 'pool', 'lock', '_initialized', '_closed')
+
     def __init__(self, db_file=None, max_size=5, ** kwargs):
         self.db_file = db_file
         self.max_size = max_size

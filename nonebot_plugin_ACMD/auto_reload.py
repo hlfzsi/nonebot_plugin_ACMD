@@ -1,20 +1,29 @@
+"""
+Warning !!!
+屎山!
+是那种连报错都抛不出来的屎山!
+某人摆烂中...
+"""
+
+import asyncio
 import importlib
 import importlib.util
-import asyncio
-import os
-import aiofiles
-import sys
 import inspect
+import os
 import pickle
-from typing import Dict, Set, List, Optional
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler, FileSystemEvent
-from nonebot import logger
-from .command_signer import BasicHandler
-from .command import Command
-from .ACMD_driver import executor
+import sys
 
-# 依赖跟踪器
+import aiofiles
+from watchdog.events import FileSystemEventHandler, FileSystemEvent
+from watchdog.observers import Observer
+
+from typing import Dict, Set, List, Optional
+
+from .ACMD_driver import executor
+from .command import Command
+from .command_signer import BasicHandler
+from .cli import CommandRegistry
+from nonebot import logger
 
 
 class DependencyTracker(importlib.abc.MetaPathFinder):
@@ -42,7 +51,7 @@ class AsyncReloader(FileSystemEventHandler):
         self.package_path = package_path
         self.queue = queue
         self.reloading = False  # 标志是否正在进行重新加载
-        self.reload_delay = 0.5  # 重新加载延迟时间（秒）
+        self.reload_delay = 1.0  # 重新加载延迟时间（秒）
         self.pending_events: Set[FileSystemEvent] = set()  # 用于去重的集合
         self.current_event: Optional[FileSystemEvent] = None  # 当前正在处理的事件
         self.event_task: Optional[asyncio.Task] = None  # 用于合并事件的任务
@@ -79,6 +88,12 @@ class AsyncReloader(FileSystemEventHandler):
             async with aiofiles.open(state_file, 'wb') as f:
                 await f.write(pickle.dumps(state))
             logger.info(f"State for {module_name} saved successfully.")
+
+            def del_state():
+                path = state_file
+                if os.path.exists(path):
+                    os.remove(path)
+            return del_state
         except Exception as e:
             logger.error(f"Failed to save state for {module_name}: {e}")
             raise
@@ -102,8 +117,9 @@ class AsyncReloader(FileSystemEventHandler):
     async def _reload_module(self, package_name: str) -> None:
         # 保存当前状态
         old_module = sys.modules.get(package_name)
+        clean = None
         if old_module and hasattr(old_module, '__state__'):
-            await self._save_state(package_name, old_module.__state__)
+            clean = await self._save_state(package_name, old_module.__state__)
 
         # 提取与当前重载模块相关的函数，并准备清理
         cleanup_funcs = []
@@ -115,6 +131,8 @@ class AsyncReloader(FileSystemEventHandler):
                 ) if asyncio.iscoroutinefunction(call.func) else asyncio.to_thread(call.call)))
                 executor.on_end_functions.discard(call)
         await asyncio.gather(*cleanup_funcs)
+        for cmd in CommandRegistry._tracker.get(self.package_path, []):
+            CommandRegistry.disable_command(str(cmd))
 
         try:
             # 处理依赖...
@@ -139,6 +157,9 @@ class AsyncReloader(FileSystemEventHandler):
                 sys.modules[package_name] = old_module
                 old_module.__state__ = await self._load_state(package_name)
             raise e
+        finally:
+            if clean:
+                clean()
 
     def _find_dependents(self, package_name: str) -> List[str]:
         # 获取依赖模块的绝对路径

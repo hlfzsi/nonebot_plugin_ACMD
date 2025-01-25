@@ -1,9 +1,22 @@
-from abc import abstractmethod
-from typing import Callable, Type, Coroutine, Union, Optional, Any
-from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, PrivateMessageEvent
 import inspect
+from functools import update_wrapper, partial
 import os
+import types
+
+from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, PrivateMessageEvent
+
+from typing import Callable, Dict, Type, Coroutine, Union, Any, get_type_hints
+
+from abc import abstractmethod
+
 from .command_signer import BasicHandler
+from .Atypes import (
+    UserInput,
+    GroupID,
+    ImageInput,
+    PIN,
+    Record
+)
 
 
 class MessageHandler(BasicHandler):
@@ -11,7 +24,7 @@ class MessageHandler(BasicHandler):
         slot for slot in BasicHandler.__slots__ if slot != '__weakref__')
 
     @abstractmethod
-    async def handle(self, bot: Bot = None, event: Union[GroupMessageEvent, PrivateMessageEvent] = None, msg: str = None, qq: str = None, groupid: str = None, image: Optional[str] = None, ** kwargs: Any) -> None:
+    async def handle(self, bot: Bot = None, event: Union[GroupMessageEvent, PrivateMessageEvent] = None, msg: UserInput = None, qq: PIN = None, groupid: GroupID = None, image: ImageInput = None) -> None:
         """处理接收到的消息。
 
         参数:
@@ -31,7 +44,7 @@ class GroupMessageHandler(BasicHandler):
         slot for slot in BasicHandler.__slots__ if slot != '__weakref__')
 
     @abstractmethod
-    async def handle(self, bot: Bot = None, event: GroupMessageEvent = None, msg: str = None, qq: str = None, groupid: str = None, image: Optional[str] = None, ** kwargs: Any) -> None:
+    async def handle(self, bot: Bot = None, event: GroupMessageEvent = None, msg: UserInput = None, qq: PIN = None, groupid: GroupID = None, image: ImageInput = None) -> None:
         """处理接收到的消息。
 
         参数:
@@ -57,7 +70,7 @@ class PrivateMessageHandler(BasicHandler):
         slot for slot in BasicHandler.__slots__ if slot != '__weakref__')
 
     @abstractmethod
-    async def handle(self, bot: Bot = None, event:  PrivateMessageEvent = None, msg: str = None, qq: str = None, groupid: str = None, image: Optional[str] = None, ** kwargs: Any) -> None:
+    async def handle(self, bot: Bot = None, event: PrivateMessageEvent = None, msg: UserInput = None, qq: PIN = None, groupid: GroupID = None, image: ImageInput = None) -> None:
         """处理接收到的消息。
 
         参数:
@@ -157,37 +170,37 @@ class func_to_Handler:
 
     @staticmethod
     def _create_handle_method(func: Callable[..., Coroutine]) -> Callable:
+        """创建一个 handle 方法，明确列出所有参数，包括类型注解"""
         sig = inspect.signature(func)
-        param_names = set(sig.parameters.keys())
-        has_kwargs = any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        params = list(sig.parameters.values())
 
-        async def handle(self, bot=None, event=None, msg=None, qq=None, groupid=None, image=None, **kwargs):
-            # 创建一个字典来存储匹配的参数
-            params = {
-                'bot': bot,
-                'event': event,
-                'msg': msg,
-                'qq': qq,
-                'groupid': groupid,
-                'image': image,
-                'self': self,
-                'Handler': self,
-                **kwargs
-            }
-            # 保留 func 需要的参数
-            matched_params = {k: v for k,
-                              v in params.items() if k in param_names}
-            # 保留未匹配的参数
-            unmatched_params = {k: v for k,
-                                v in params.items() if k not in param_names}
+        # 获取函数的类型注解
+        type_hints = get_type_hints(func)
 
-            # 构建最终的参数字典
-            final_params = matched_params
-            if has_kwargs:
-                final_params.update(unmatched_params)
+        # 构建新的参数列表，将 'self' 添加为第一个参数，除非 'func' 已经有 'self'
+        new_params = [inspect.Parameter(
+            'self', inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+        if not (params and params[0].name == 'self'):
+            for param in params:
+                annotation = type_hints.get(param.name, param.annotation)
+                new_params.append(inspect.Parameter(
+                    param.name,
+                    param.kind,
+                    default=param.default,
+                    annotation=annotation
+                ))
 
-            # 调用 func 并传递参数
-            await func(**final_params)
+        # 构建新的签名
+        new_sig = sig.replace(parameters=new_params)
 
-        return handle
+        async def handle(self, *args, **kwargs):
+            bound_args = new_sig.bind(self, *args, **kwargs)
+            bound_args.apply_defaults()
+            return await func(*bound_args.args[1:], **bound_args.kwargs)
+
+        # 更新 handle 方法的签名以匹配新的参数列表
+        handle.__signature__ = new_sig
+
+        wrapper = update_wrapper(handle, func)
+
+        return wrapper
