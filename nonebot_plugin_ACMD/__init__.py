@@ -23,7 +23,7 @@ from .command import (
 from .Atypes import HandlerContext, HandlerInvoker
 HandlerInvoker.import_BasicHandler()
 driver = get_driver()
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 __plugin_meta__ = PluginMetadata(
     name="nonebot-plugin-ACMD",
     description="插件开发新方案,支持用户输入纠错、命令行指令、热重载，目标是Advanced CMD ( 目前不太可能 )",

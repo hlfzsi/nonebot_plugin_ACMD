@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "nonebot_plugin_ACMD"
-version = "0.0.3"
+version = "0.0.4"
 description = "一个专注于解决输入问题的命令实现。"
 authors = ["hlfzsi"]
 license = "AGPL-3.0"
