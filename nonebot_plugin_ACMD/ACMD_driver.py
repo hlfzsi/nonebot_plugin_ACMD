@@ -1,3 +1,4 @@
+from __future__ import annotations
 import asyncio
 from nonebot import logger
 from typing import Callable, Tuple, Dict, Any, Set

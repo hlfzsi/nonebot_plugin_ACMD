@@ -5,6 +5,7 @@ Warning !!!
 某人摆烂中...
 """
 
+from __future__ import annotations
 import asyncio
 import importlib
 import importlib.util
@@ -20,8 +21,8 @@ from watchdog.observers import Observer
 from typing import Dict, Set, List, Optional
 
 from .ACMD_driver import executor
-from .command import Command
 from .command_signer import BasicHandler
+from .command import Command
 from .cli import CommandRegistry
 from nonebot import logger
 

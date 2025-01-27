@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 import inspect
 from collections import defaultdict
@@ -9,12 +10,14 @@ import sqlite3
 import aiosqlite
 import pandas as pd
 from rapidfuzz import fuzz
-from typing import Awaitable, List, Union, Any, Optional, Dict, Callable, Final
+from typing import Awaitable, List, Union, Any, Dict, Callable, Final, Optional
 
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, PrivateMessageEvent
 from .connection_pool import SQLitePool
+from .config import Config
 from .cli import CommandRegistry
+from .command_signer import HandlerManager
 from .Atypes import HandlerInvoker, HandlerContext
 from .Atypes import (
     UserInput,
@@ -53,7 +56,6 @@ def create_memory_table():
         )
     ''')
 
-    # 创建索引以提高查询性能
     cursor.execute('''
         CREATE INDEX IF NOT EXISTS idx_owners ON commands(owner)
     ''')
@@ -239,23 +241,43 @@ class Command:
 
 
 class CommandFactory:
+    """
+    工厂类,包含所有创建命令所需要的方法
+
+    P.S 该类设计并不符合工厂类规范
+    """
     @staticmethod
-    def create_command(commands: List[str], handler_list: List[Union[str, BasicHandler]], owner: str, description: str = '', full_match: bool = False) -> Command:
+    def create_command(commands: Optional[List[str]] = None, handler_list: Union[str, int, BasicHandler, List[Union[str, int, BasicHandler]]] = None, owner: Optional[str] = None, description: Optional[str] = '', full_match: bool = False) -> Optional[Command]:
         """创建命令对象。
 
         Args:
-            commands (List[str]):命令列表
-            handler_list (List[Union[str, BasicHandler]]):处理器列表
-            owner (str):所有者,用于标识指令所属插件
+            commands (List[str]): 命令列表。不传入或传入`None`代表无需命令，总是触发。
+            handler_list (str, int, BasicHandler, List[str, int, BasicHandler]): 处理器单例或列表
+            owner (str): 所有者, 用于标识指令所属插件
             description (str, optional): 描述. Defaults to ''.
             full_match (bool, optional): 是否完全匹配. Defaults to False.
 
         Returns:
             Command: 命令对象
         """
+        if handler_list is None:
+            raise RuntimeError("没有处理器传入")
+
+        if not isinstance(handler_list, list):
+            handler_list = [handler_list]
+
         caller_frame = inspect.stack()[1]
-        caller_filename = caller_frame.filename
-        script_folder_path = os.path.abspath(os.path.dirname(caller_filename))
+        script_folder_path = os.path.abspath(
+            os.path.dirname(caller_frame.filename))
+
+        if commands is None:
+            for handler in handler_list:
+                HandlerManager.set_Unconditional_handler(handler)
+            return None
+
+        if owner is None:
+            raise RuntimeError(f"命令 {commands} 没有指定拥有者")
+
         return Command(commands, description, owner, full_match, handler_list, script_folder_path=script_folder_path)
 
     @staticmethod
@@ -286,6 +308,30 @@ class CommandFactory:
         def decorator(func: Callable[..., Awaitable[None]]) -> Callable[..., Awaitable[None]]:
             CommandRegistry.register(cmd)(func)
             return func
+        return decorator
+
+    @staticmethod
+    def parameter_injection(field: str, field_type: type):
+        """
+        装饰器用于设置依赖关系，确保可以被解析并由handler调用。
+
+        参数:
+            field (str): 新字段的名称。
+            field_type (type): 新字段的类型。
+        """
+        def decorator(func):
+            # 检查func是否为协程函数
+            if not inspect.iscoroutinefunction(func):
+                raise RuntimeError("被装饰函数必须是异步的")
+
+            HandlerContext.insert_field(field, field_type, func)
+
+            async def wrapper(*args, **kwargs):
+                result = await func(*args, **kwargs)
+                return result
+
+            return wrapper
+
         return decorator
 
 
@@ -339,7 +385,10 @@ def _fuzzy_match_ratio(s1: str, s2: str) -> float:
     返回:
     模糊匹配相似度分数，范围从0到100
     """
-    return fuzz.WRatio(s1, s2)
+    should_trim = s1.endswith(('~', '～'))
+    trimmed_s1 = s1[:-1] if should_trim else s1
+
+    return fuzz.QRatio(trimmed_s1, s2[:len(trimmed_s1)])
 
 
 async def dispatch(
@@ -371,12 +420,9 @@ async def dispatch(
         finally:
             await cursor.close()
 
-    if not commands:
-        return
-
     df_commands = pd.DataFrame(
         commands, columns=['command', 'handler_list', 'full_match'])
-    best_match, best_match_handlers, exact_match, highest_similarity = '', [], False, 0.0
+    best_match, best_match_handlers, exact_match, highest_similarity = '', [], False, 100.0
 
     # 检查完全匹配
     exact_matches = df_commands[df_commands['command'] == message]
@@ -416,7 +462,7 @@ async def dispatch(
             max_similarity = df_commands['similarity'].max()
             best_match_rows = df_commands[df_commands['similarity']
                                           == max_similarity]
-            if len(best_match_rows) == 1 and max_similarity >= 65:
+            if len(best_match_rows) == 1 and max_similarity >= Config.Similarity_Rate:
                 best_match_row = best_match_rows.iloc[0]
                 best_match: str = best_match_row['command']
                 best_match_handlers = best_match_row['handler_list'].split(',')
@@ -432,7 +478,7 @@ async def dispatch(
     if best_match:
         command_full_match = df_commands[df_commands['command']
                                          == best_match]['full_match'].iloc[0]
-        if command_full_match and abs(len(message) - len(best_match)) >= 1:
+        if command_full_match and abs(len(message) - len(best_match)) >= 3:
             return
 
         # 替换消息内容
@@ -445,12 +491,13 @@ async def dispatch(
 
     best_match_handlers = [int(handle_id) for handle_id in best_match_handlers]
 
-    # 继续执行处理程序
+    # 继续执行处理程序.首先运行命令，然后运行全量
+    handler_context = None
     try:
-        if best_match:
+        if best_match or HandlerManager._Unconditional_Handler:
             handler_context = HandlerContext(
                 msg=UserInput(message.replace(
-                    best_match, '', 1).strip(), message),
+                    best_match, '', 1).strip(), message, best_match),
                 image=ImageInput(image),
                 pin=PIN(str(event.user_id), event.avatar),
                 groupid=GroupID(groupid, int(groupid)),
@@ -459,10 +506,13 @@ async def dispatch(
                 record=Record(similarity=highest_similarity,
                               handlers=best_match_handlers)
             )
+        if best_match:
             for handler in best_match_handlers:
                 await HandlerInvoker.invoke_handler(handler, handler_context)
     finally:
-        pass
+        if handler_context:
+            for handler in HandlerManager._Unconditional_Handler:
+                await HandlerInvoker.invoke_handler(handler, handler_context, rasie_StopPropagation=False)
 
 
 class Helper(BasicHandler):

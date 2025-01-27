@@ -1,11 +1,10 @@
-# 标准库模块
+from __future__ import annotations
 import inspect
 import os
 import threading
 from collections import defaultdict
 from weakref import WeakValueDictionary
-
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 from abc import ABC, abstractmethod, ABCMeta
 
@@ -16,7 +15,6 @@ from .Atypes import (
     GroupID,
     ImageInput,
     PIN,
-    Record,
     HandlerContext
 )
 
@@ -91,16 +89,8 @@ class BasicHandler(ABC, metaclass=SingletonABCMeta):
 
     @abstractmethod
     async def handle(self, bot: Bot = None, event: Union[GroupMessageEvent, PrivateMessageEvent] = None, msg: UserInput = None, qq: PIN = None, groupid: GroupID = None, image: ImageInput = None) -> None:
-        """处理接收到的消息。
-
-        参数:
-            bot (Bot): 机器人实例
-            event (Union[GroupMessageEvent, PrivateMessageEvent]): 消息事件
-            msg (str): 处理后的消息文本
-            qq (str): 发送者的QQ号
-            groupid (str): 群组ID（私聊时为 -1 ）
-            image (Optional[str]): 图片URL（如果有,且最多一张）
-            **kwargs (BasicHandler): 其他关键字参数
+        """
+        传入参数详见Atypes
         """
         pass
 
@@ -147,12 +137,16 @@ class HandlerManager:
     _handler_to_id: dict[BasicHandler, int] = {}
     _next_id: int = 1
     _lock: threading.Lock = threading.Lock()
+    _Unconditional_Handler_Lock = threading.Lock()
+    _Unconditional_Handler: List[int] = []  # handler.id
+
+    @classmethod
+    def set_Unconditional_handler(cls, handler: Union[BasicHandler,int]) -> None:
+        with cls._Unconditional_Handler_Lock:
+            cls._Unconditional_Handler.append(handler.handler_id if isinstance(handler,BasicHandler) else int(handler))
 
     @classmethod
     def get_id(cls, handler: BasicHandler) -> int:
-        if handler in cls._handler_to_id:
-            return cls._handler_to_id[handler]
-
         with cls._lock:
             if handler in cls._handler_to_id:
                 return cls._handler_to_id[handler]
@@ -170,6 +164,9 @@ class HandlerManager:
 
     @classmethod
     def remove_handler(cls, handler: BasicHandler) -> bool:
+        with cls._Unconditional_Handler_Lock:
+            if handler.handler_id in cls._Unconditional_Handler:
+                cls._Unconditional_Handler.remove(handler.handler_id)
         with cls._lock:
             if handler in cls._handler_to_id:
                 handler_id = cls._handler_to_id.pop(handler)

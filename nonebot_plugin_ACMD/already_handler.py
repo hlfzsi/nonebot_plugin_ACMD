@@ -1,3 +1,4 @@
+from __future__ import annotations
 import inspect
 from functools import update_wrapper
 import os
@@ -13,47 +14,70 @@ from .Atypes import (
     UserInput,
     GroupID,
     ImageInput,
-    PIN,
-    Record
+    PIN
 )
 
 
 class MessageHandler(BasicHandler):
+    """继承自处理器基类,没有实现任何过滤逻辑
+
+    - 必须实现异步方法 handle
+
+    - 属性:
+        - block (bool): 是否阻断传播,默认为True
+        - handler_id (int): 处理器ID,由HandlerManager自动分配
+        - unique (str): 处理器唯一标识符,可用于测试辨识,默认为None
+
+    - 可使用的方法:
+        - is_PrivateMessageEvent 判断当前消息事件是否为私聊消息
+        - get_self_id 获取当前处理器实例的处理ID
+        - get_handler_by_id 通过处理ID获取处理器实例
+        - get_handler_id 通过处理器实例获取处理ID
+
+
+    - 推荐重写方法 (按执行顺序排列) :
+        - should_handle 异步  该处理器是否应当执行 , 必须返回bool
+        - should_block 异步  该处理器是否阻断传播 , 必须返回bool
+    """
     __slots__ = tuple(
         slot for slot in BasicHandler.__slots__ if slot != '__weakref__')
 
     @abstractmethod
     async def handle(self, bot: Bot = None, event: Union[GroupMessageEvent, PrivateMessageEvent] = None, msg: UserInput = None, qq: PIN = None, groupid: GroupID = None, image: ImageInput = None) -> None:
-        """处理接收到的消息。
-
-        参数:
-            bot (Bot): 机器人实例
-            event (Union[GroupMessageEvent, PrivateMessageEvent]): 消息事件
-            msg (str): 处理后的消息文本
-            qq (str): 发送者的QQ号
-            groupid (str): 群组ID（私聊时为 -1 ）
-            image (Optional[str]): 图片URL（如果有,且最多一张）
-            **kwargs (BasicHandler): 其他关键字参数
+        """
+        传入参数详见Atypes
         """
         pass
 
 
 class GroupMessageHandler(BasicHandler):
+    """只处理群聊消息,继承自处理器基类
+
+    - 必须实现异步方法 handle
+
+    - 属性:
+        - block (bool): 是否阻断传播,默认为True
+        - handler_id (int): 处理器ID,由HandlerManager自动分配
+        - unique (str): 处理器唯一标识符,可用于测试辨识,默认为None
+
+    - 可使用的方法:
+        - is_PrivateMessageEvent 判断当前消息事件是否为私聊消息
+        - get_self_id 获取当前处理器实例的处理ID
+        - get_handler_by_id 通过处理ID获取处理器实例
+        - get_handler_id 通过处理器实例获取处理ID
+
+
+    - 推荐重写方法 (按执行顺序排列) :
+        - should_handle 异步  该处理器是否应当执行 , 必须返回bool
+        - should_block 异步  该处理器是否阻断传播 , 必须返回bool
+    """
     __slots__ = tuple(
         slot for slot in BasicHandler.__slots__ if slot != '__weakref__')
 
     @abstractmethod
     async def handle(self, bot: Bot = None, event: GroupMessageEvent = None, msg: UserInput = None, qq: PIN = None, groupid: GroupID = None, image: ImageInput = None) -> None:
-        """处理接收到的消息。
-
-        参数:
-            bot (Bot): 机器人实例
-            event (Union[GroupMessageEvent, PrivateMessageEvent]): 消息事件
-            msg (str): 处理后的消息文本
-            qq (str): 发送者的QQ号
-            groupid (str): 群组ID（私聊时为 -1 ）
-            image (Optional[str]): 图片URL（如果有,且最多一张）
-            **kwargs (BasicHandler): 其他关键字参数
+        """
+        传入参数详见Atypes
         """
         pass
 
@@ -65,21 +89,33 @@ class GroupMessageHandler(BasicHandler):
 
 
 class PrivateMessageHandler(BasicHandler):
+    """只处理私聊消息,继承自处理器基类
+
+    - 必须实现异步方法 handle
+
+    - 属性:
+        - block (bool): 是否阻断传播,默认为True
+        - handler_id (int): 处理器ID,由HandlerManager自动分配
+        - unique (str): 处理器唯一标识符,可用于测试辨识,默认为None
+
+    - 可使用的方法:
+        - is_PrivateMessageEvent 判断当前消息事件是否为私聊消息
+        - get_self_id 获取当前处理器实例的处理ID
+        - get_handler_by_id 通过处理ID获取处理器实例
+        - get_handler_id 通过处理器实例获取处理ID
+
+
+    - 推荐重写方法 (按执行顺序排列) :
+        - should_handle 异步  该处理器是否应当执行 , 必须返回bool
+        - should_block 异步  该处理器是否阻断传播 , 必须返回bool
+    """
     __slots__ = tuple(
         slot for slot in BasicHandler.__slots__ if slot != '__weakref__')
 
     @abstractmethod
     async def handle(self, bot: Bot = None, event: PrivateMessageEvent = None, msg: UserInput = None, qq: PIN = None, groupid: GroupID = None, image: ImageInput = None) -> None:
-        """处理接收到的消息。
-
-        参数:
-            bot (Bot): 机器人实例
-            event (Union[GroupMessageEvent, PrivateMessageEvent]): 消息事件
-            msg (str): 处理后的消息文本
-            qq (str): 发送者的QQ号
-            groupid (str): 群组ID（私聊时为 -1 ）
-            image (Optional[str]): 图片URL（如果有,且最多一张）
-            **kwargs (BasicHandler): 其他关键字参数
+        """
+        传入参数详见Atypes
         """
         pass
 

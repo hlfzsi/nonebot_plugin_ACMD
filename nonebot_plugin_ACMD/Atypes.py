@@ -1,4 +1,4 @@
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 import asyncio
 from queue import Queue
 from inspect import _empty, signature
@@ -33,6 +33,7 @@ class UserInput:
     属性:
         body (str): 用户消息去除命令部分的字符串。例如，如果用户发送的消息是“/command message”，则body将是“message”。
         full (str): 完整的用户消息字符串，包含用户发送的所有内容。
+        cmd (str): 用户所触发的具体命令
     """
     body: str
     """
@@ -42,6 +43,10 @@ class UserInput:
     full: str
     """
     说明: 完整用户消息，包括所有命令和参数。
+    """
+    cmd: str
+    """
+    说明: 用户所触发的具体命令。
     """
 
 
@@ -190,18 +195,10 @@ class ImageInput:
 @dataclass(order=True)
 class Record:
     """消息处理记录"""
-    similarity: float = field(
-        default=100.0,
-        compare=True,
-    )
-    handlers: List[int] = field(
-        default_factory=list,
-        compare=False,
-    )
+    similarity: float = field(default=100.0, compare=True)
+    handlers: List[int] = field(default_factory=list, compare=False)
     futures: Dict[int, asyncio.Task[Any]] = field(
-        default_factory=dict,
-        compare=False,
-    )
+        default_factory=dict, compare=False)
 
     @staticmethod
     def colored(text: str, color_code: int) -> str:
@@ -215,24 +212,21 @@ class Record:
         color_futures = 32     # 绿色
         color_misc = 90        # 深灰色（用于其它信息）
 
-        record_dict = asdict(self)
-
         # 构建属性字符串表示
         attr_str_parts = []
-        for key, value in record_dict.items():
+        for key in ['similarity', 'handlers', 'futures']:
+            value = getattr(self, key)
             if key == "similarity":
                 color = color_similarity
             elif key == "handlers":
                 color = color_handlers
-            elif key == "futures":
+            else:  # key == "futures"
                 color = color_futures
-            else:
-                color = color_misc
 
-            # 处理特殊类型，例如future对象
+            # 特殊处理futures属性
             if key == "futures":
-                value_str = "{  " + " , ".join(f"{k}: {v._state}" for k,
-                                               v in value.items()) + "  }"
+                value_str = "{  " + ", ".join(f"{k}: {v._state}" for k,
+                                              v in value.items()) + "  }" if value else "{}"
             else:
                 value_str = str(value)
 
@@ -438,15 +432,19 @@ class HandlerContext:
             handler.parameters = cls.fill_parameters(handler)
 
 
-from .command_signer import BasicHandler  # noqa
-
-
 class HandlerInvoker:
+    @staticmethod
+    def import_BasicHandler():
+        """无奈ing"""
+        global BasicHandler
+        from .command_signer import BasicHandler
+
     @classmethod
     async def invoke_handler(
         cls,
         handler_id: int,
         context: 'HandlerContext',
+        rasie_StopPropagation: bool = True
     ) -> None:
         handler = BasicHandler.get_handler_by_id(handler_id)
         if not handler:
@@ -493,7 +491,7 @@ class HandlerInvoker:
                     context.record.futures[handler_id] = task
 
                 case 'should_block':
-                    if await func(*params):
+                    if await func(*params) and rasie_StopPropagation is True:
                         raise StopPropagation
 
                 case _:
