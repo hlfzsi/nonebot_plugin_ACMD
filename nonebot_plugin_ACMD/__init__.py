@@ -9,7 +9,7 @@ from nonebot.rule import is_type
 from nonebot.plugin import PluginMetadata
 
 from .cli import App
-from .config import Config
+from .config import Config,config
 from .ACMD_driver import get_driver as ACMD_get_driver
 from .auto_reload import HotSigner
 from .command_signer import BasicHandler
@@ -23,7 +23,7 @@ from .command import (
 from .Atypes import HandlerContext, HandlerInvoker
 HandlerInvoker.import_BasicHandler()
 driver = get_driver()
-__version__ = "0.0.4"
+__version__ = "0.0.5"
 __plugin_meta__ = PluginMetadata(
     name="nonebot-plugin-ACMD",
     description="插件开发新方案,支持用户输入纠错、命令行指令、热重载，目标是Advanced CMD ( 目前不太可能 )",
@@ -52,10 +52,10 @@ async def abcstart():
 /_/    \_|_| |_|\___/ \__|_| |_|\___|_|          \_____|_|  |_|_____/
 
     {ENDC}""")
-    logger.info("ACMD is initializing... please wait")
     del ENDC, YELLOW
-    await ACMD_get_driver().trigger_execution()
+    await ACMD_get_driver().trigger_execution(asyncio.get_running_loop())
     HandlerContext.set_ready()
+    Command._set_event_loop(asyncio.get_running_loop())
     HotSigner.set_event_loop(asyncio.get_running_loop())
     HotSigner.start()
     app = App()
@@ -73,7 +73,7 @@ async def abcstart():
         Args:
             Similarity_Rate (float): 相似度阈值
         """
-        Config.Similarity_Rate = Similarity_Rate
+        config.Similarity_Rate = Similarity_Rate
         logger.warning(f'本次运行时相似度阈值被设置为 {Similarity_Rate}')
 
     app.run()

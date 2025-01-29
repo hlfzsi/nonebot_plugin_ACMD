@@ -15,7 +15,7 @@ from typing import Awaitable, List, Union, Any, Dict, Callable, Final, Optional
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, PrivateMessageEvent
 from .connection_pool import SQLitePool
-from .config import Config
+from .config import config
 from .cli import CommandRegistry
 from .command_signer import HandlerManager
 from .Atypes import HandlerInvoker, HandlerContext
@@ -140,6 +140,11 @@ class Command:
     _commands_dict: defaultdict = defaultdict(WeakValueDictionary)
     _lock: threading.Lock = threading.Lock()
     __slots__ = ('data', '__weakref__')
+    _loop = None
+
+    @classmethod
+    def _set_event_loop(cls, loop: asyncio.AbstractEventLoop):
+        cls._loop = loop
 
     def __init__(self, commands: List[str], description: str, owner: str, full_match: bool, handler_list: List[Union[str, BasicHandler]], **kwargs):
         # 初始化命令数据
@@ -168,18 +173,11 @@ class Command:
 
         # 在初始化时进行验证和保存
         if self.validate():
-            if not COMMAND_POOL._initialized:
+            if not self._loop:
                 self.save()
             else:
-                try:
-                    loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    loop = None
-
-                if loop and loop.is_running():
-                    loop.create_task(self._aiosave())
-                else:
-                    asyncio.run(self._aiosave())
+                asyncio.run_coroutine_threadsafe(
+                    self._aiosave(), self._loop).result()
 
     def validate(self) -> bool:
         """验证命令数据的合法性。"""
@@ -387,8 +385,9 @@ def _fuzzy_match_ratio(s1: str, s2: str) -> float:
     """
     should_trim = s1.endswith(('~', '～'))
     trimmed_s1 = s1[:-1] if should_trim else s1
+    s2 = s2[:len(trimmed_s1)] if should_trim else s2
 
-    return fuzz.QRatio(trimmed_s1, s2[:len(trimmed_s1)])
+    return fuzz.QRatio(trimmed_s1, s2)
 
 
 async def dispatch(
@@ -462,7 +461,7 @@ async def dispatch(
             max_similarity = df_commands['similarity'].max()
             best_match_rows = df_commands[df_commands['similarity']
                                           == max_similarity]
-            if len(best_match_rows) == 1 and max_similarity >= Config.Similarity_Rate:
+            if len(best_match_rows) == 1 and max_similarity >= config.Similarity_Rate:
                 best_match_row = best_match_rows.iloc[0]
                 best_match: str = best_match_row['command']
                 best_match_handlers = best_match_row['handler_list'].split(',')

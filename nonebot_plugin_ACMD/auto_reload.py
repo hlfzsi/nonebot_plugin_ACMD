@@ -4,43 +4,122 @@ Warning !!!
 是那种连报错都抛不出来的屎山!
 某人摆烂中...
 """
-
 from __future__ import annotations
 import asyncio
+import threading
 import importlib
 import importlib.util
 import inspect
-import os
 import pickle
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from collections import defaultdict
 
 import aiofiles
+import aiofiles.os
+from nonebot import logger, require
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
 from watchdog.observers import Observer
-
-from typing import Dict, Set, List, Optional
+from typing import Dict, Set, List, Optional, Final, Any, Coroutine
 
 from .ACMD_driver import executor
 from .command_signer import BasicHandler
 from .command import Command
 from .cli import CommandRegistry
-from nonebot import logger
+
+require("nonebot_plugin_localstore")
+from nonebot_plugin_localstore import get_cache_dir  # noqa
+
+STATE_DIR: Final[str] = str(get_cache_dir("nonebot_plugin_ACMD"))
+MAX_RELOAD_WORKERS: Final[int] = 4  # 最大并发重载工作线程数
 
 
-class DependencyTracker(importlib.abc.MetaPathFinder):
+class DependencyTracker:
+    __slots__ = ('dependents_map', 'module_paths', '_lock',
+                 '_async_queue', '_async_initialized')
+
     def __init__(self):
-        self.imports: Dict[str, Set[str]] = {}
+        self.dependents_map: Dict[str, Set[str]] = defaultdict(set)
+        self.module_paths: Dict[str, str] = {}
+        self._lock = threading.Lock()
+        self._async_queue = asyncio.Queue()
+        self._async_initialized = False
 
-    def find_spec(self, fullname, path, target=None):
-        caller = sys._getframe(5).f_globals['__name__']
-        if caller != '__main__':
-            self.imports.setdefault(fullname, set()).add(caller)
-        return None  # 继续使用其他 finder
+    async def _async_update_worker(self):
+        """异步批量更新工作线程"""
+        while True:
+            updates = await self._async_queue.get()
+            with self._lock:
+                for fullname, caller in updates:
+                    self._add_dependency(fullname, caller)
+            self._async_queue.task_done()
+
+    def _ensure_async_initialized(self):
+        """确保异步工作线程初始化"""
+        if not self._async_initialized:
+            asyncio.get_event_loop().create_task(self._async_update_worker())
+            self._async_initialized = True
+
+    def _add_dependency(self, fullname: str, caller: str):
+        """原子依赖关系添加"""
+        self.dependents_map[fullname].add(caller)
+        # 缓存模块路径
+        if caller not in self.module_paths:
+            if caller in sys.modules:
+                module = sys.modules[caller]
+                if hasattr(module, '__file__') and module.__file__:
+                    self.module_paths[caller] = str(
+                        Path(module.__file__).resolve().parent)
+
+    def find_spec(self, fullname: str, path: Optional[List[str]] = None, target: Optional[object] = None):
+        # 安全获取调用者帧（降级保护）
+        try:
+            caller_frame = sys._getframe(5)
+        except ValueError:
+            caller_frame = sys._getframe(1)
+
+        caller = caller_frame.f_globals.get('__name__', '')
+
+        if not caller or caller == '__main__':
+            return None
+
+        if asyncio._get_running_loop():
+            self._ensure_async_initialized()
+            self._async_queue.put_nowait([(fullname, caller)])
+        else:
+            with self._lock:
+                self._add_dependency(fullname, caller)
+
+        return None
+
+    def _find_dependents(self, package_name: str) -> List[str]:
+        """依赖查找"""
+        dependents = set()
+
+        # 获取依赖模块
+        dependents_modules = self.dependents_map.get(package_name, set())
+        for module in dependents_modules:
+            if module in self.module_paths:
+                dependents.add(self.module_paths[module])
+
+        # 添加自身模块路径
+        if package_name in sys.modules:
+            module = sys.modules[package_name]
+            if hasattr(module, '__file__') and module.__file__:
+                path = str(Path(module.__file__).resolve().parent)
+                if Path(path).exists():
+                    dependents.add(path)
+
+        return list(dependents)
 
 
 # 注册依赖跟踪器
 tracker = DependencyTracker()
 sys.meta_path.insert(0, tracker)
+
+# 全局线程池
+reload_executor = ThreadPoolExecutor(max_workers=MAX_RELOAD_WORKERS)
 
 # 命令处理器字典
 Handler_Dict: Dict[str, List[BasicHandler]] = BasicHandler._path_instances
@@ -48,294 +127,317 @@ Command_Dict: Dict[str, List[Command]] = Command._commands_dict
 
 
 class AsyncReloader(FileSystemEventHandler):
-    def __init__(self, package_path: str, queue: asyncio.Queue, loop) -> None:
+    def __init__(self, package_path: str, loop: asyncio.AbstractEventLoop) -> None:
         self.package_path = package_path
-        self.queue = queue
-        self.reloading = False  # 标志是否正在进行重新加载
-        self.reload_delay = 1.0  # 重新加载延迟时间（秒）
-        self.pending_events: Set[FileSystemEvent] = set()  # 用于去重的集合
-        self.current_event: Optional[FileSystemEvent] = None  # 当前正在处理的事件
-        self.event_task: Optional[asyncio.Task] = None  # 用于合并事件的任务
-        self.loop = loop  # 主线程的事件循环
-        # 用于避免短时间多次重载
+        self.loop = loop
+        self.reload_lock = asyncio.Lock()
+        self.reload_delay = 1.0
+        self.pending_tasks: Set[asyncio.Task] = set()
+        self.module_state_cache: Dict[str, Any] = {}
+        self._file_event_queue = asyncio.Queue()
 
-    async def reload_package(self, event: Optional[FileSystemEvent] = None) -> None:
-        if self.reloading:
-            logger.debug("Reload already in progress, skipping.")
-            return
-        self.reloading = True
+    async def process_events(self):
+        """任务处理事件队列"""
+        while True:
+            event = await self._file_event_queue.get()
+            async with self.reload_lock:
+                await self._schedule_reload(event)
+            self._file_event_queue.task_done()
 
-        package_name = self._get_package_name(self.package_path)
-        if package_name in sys.modules:
-            try:
-                await asyncio.sleep(self.reload_delay)
-                await self._reload_module(package_name)
-                logger.success(f"Reloaded package: {package_name}")
-            except Exception as e:
-                logger.error(f"Failed to reload package {package_name}: {e}")
-                raise
-            finally:
-                self.reloading = False
-        else:
-            logger.info(f"Skipped reloading: {package_name} is not loaded")
+    async def _schedule_reload(self, event: FileSystemEvent):
+        """调度重载任务"""
+        package_name = self._get_package_name()
+        logger.debug(f"Detected change in {
+                     package_name}, scheduling reload...")
 
-    def _get_package_name(self, path: str) -> str:
-        relative_path = os.path.relpath(path, os.getcwd()).replace(os.sep, '.')
-        return relative_path
+        # 取消之前的未完成重载任务
+        for task in self.pending_tasks:
+            if not task.done():
+                task.cancel()
 
-    async def _save_state(self, module_name: str, state):
-        state_file = f"{module_name}.state"
+        new_task = self.loop.create_task(
+            self._debounced_reload(package_name),
+            name=f"ReloadTask-{package_name}"
+        )
+        self.pending_tasks.add(new_task)
+        new_task.add_done_callback(lambda t: self.pending_tasks.discard(t))
+
+    async def _debounced_reload(self, package_name: str):
+        """防抖重载逻辑"""
+        await asyncio.sleep(self.reload_delay)
+        await self._safe_reload(package_name)
+
+    async def _safe_reload(self, package_name: str):
+        """安全重载包装"""
         try:
-            async with aiofiles.open(state_file, 'wb') as f:
-                await f.write(pickle.dumps(state))
-            logger.info(f"State for {module_name} saved successfully.")
-
-            def del_state():
-                path = state_file
-                if os.path.exists(path):
-                    os.remove(path)
-            return del_state
+            await self._reload_module(package_name)
+            logger.success(f"Successfully reloaded package: {package_name}")
         except Exception as e:
-            logger.error(f"Failed to save state for {module_name}: {e}")
-            raise
+            logger.error(f"Reload failed for {package_name}: {str(e)}")
+            # 回滚模块状态
+            if package_name in self.module_state_cache:
+                await self._restore_module_state(package_name)
 
-    async def _load_state(self, module_name: str):
-        state_file = f"{module_name}.state"
-        if not os.path.exists(state_file):
-            logger.debug(f"No state file found for {module_name}.")
-            return None
+    def on_any_event(self, event: FileSystemEvent) -> None:
+        """主线程触发的同步事件处理"""
+        if not event.is_directory and event.src_path.endswith('.py'):
+            # 将事件推送到异步队列
+            self.loop.call_soon_threadsafe(
+                self._file_event_queue.put_nowait, event
+            )
+
+    def _get_package_name(self) -> str:
+        """获取标准化的包名称"""
+        return Path(self.package_path).resolve().relative_to(Path.cwd()).as_posix().replace('/', '.')
+
+    async def _save_state(self, module_name: str) -> Coroutine[None, None, None]:
+        """异步保存模块状态"""
+        old_module = sys.modules.get(module_name)
+        if not old_module or not hasattr(old_module, '__state__'):
+            return
+
+        try:
+            # 使用线程池执行pickle序列化
+            state = await self.loop.run_in_executor(
+                reload_executor,
+                pickle.dumps,
+                old_module.__state__
+            )
+            state_file = Path(STATE_DIR) / f"{module_name}.state"
+
+            async with aiofiles.open(state_file, 'wb') as f:
+                await f.write(state)
+
+            self.module_state_cache[module_name] = state_file
+            logger.debug(f"Saved state for {module_name}")
+        except Exception as e:
+            logger.error(f"Failed to save state for {module_name}: {str(e)}")
+
+    async def _restore_module_state(self, module_name: str):
+        """恢复模块状态"""
+        state_file = self.module_state_cache.get(module_name)
+        if not state_file or not state_file.exists():
+            return
 
         try:
             async with aiofiles.open(state_file, 'rb') as f:
-                content = await f.read()
-                state = pickle.loads(content)
-            logger.info(f"State for {module_name} loaded successfully.")
-            return state
+                state_data = await f.read()
+
+            state = await self.loop.run_in_executor(
+                reload_executor,
+                pickle.loads,
+                state_data
+            )
+
+            if module := sys.modules.get(module_name):
+                module.__state__ = state
+                logger.debug(f"Restored state for {module_name}")
         except Exception as e:
-            logger.error(f"Failed to load state for {module_name}: {e}")
-            return None
+            logger.error(f"Failed to restore state for {
+                         module_name}: {str(e)}")
+        finally:
+            await aiofiles.os.remove(state_file)
 
     async def _reload_module(self, package_name: str) -> None:
-        # 保存当前状态
-        old_module = sys.modules.get(package_name)
-        clean = None
-        if old_module and hasattr(old_module, '__state__'):
-            clean = await self._save_state(package_name, old_module.__state__)
+        """主重载逻辑"""
 
-        # 提取与当前重载模块相关的函数，并准备清理
-        cleanup_funcs = []
-        for func_key, call in list(executor.registered_functions.items()):
-            module_name, func_qualname = func_key
-            if module_name == package_name or module_name.startswith(f"{package_name}."):
-                call = executor.registered_functions.pop(func_key)
-                cleanup_funcs.append(asyncio.create_task(call.call(
-                ) if asyncio.iscoroutinefunction(call.func) else asyncio.to_thread(call.call)))
-                executor.on_end_functions.discard(call)
-        await asyncio.gather(*cleanup_funcs)
+        # 清理命令系统
+        await self._cleanup_commands(package_name)
+
+        await self.loop.run_in_executor(
+            None,
+            self._sync_pre_reload,
+            package_name
+        )
+
+        try:
+            # 异步保存状态
+            await self._save_state(package_name)
+
+            # 在线程池执行模块卸载
+            await self.loop.run_in_executor(
+                reload_executor,
+                self._unload_modules,
+                package_name
+            )
+
+            # 异步加载新模块
+            new_module = await self._async_load_module(package_name)
+
+            # 恢复状态
+            if new_module is not None:
+                await self._restore_module_state(package_name)
+
+        except Exception as e:
+            logger.error(f"Reload aborted due to error: {str(e)}")
+            raise
+
+    def _sync_pre_reload(self, package_name: str):
+        """在主线程执行的预重载操作"""
+        # 清理命令注册
         for cmd in CommandRegistry._tracker.get(self.package_path, []):
             CommandRegistry.disable_command(str(cmd))
 
-        try:
-            # 处理依赖...
-            dependent_modules = self._find_dependents(package_name)
-            await self._call_command_method('delete', dependent_modules)
-            self._call_handler_method('remove', dependent_modules)
-
-            # 卸载模块...
-            self._unload_module(package_name)
-
-            # 加载新模块...
-            await self._load_module(package_name, self.package_path)
-
-            # 恢复状态...
-            new_module = sys.modules[package_name]
-            new_module.__state__ = await self._load_state(package_name)
-
-        except Exception as e:
-            logger.error(f"Failed to reload package {package_name}: {e}")
-            # 回滚到旧版本
-            if old_module is not None:
-                sys.modules[package_name] = old_module
-                old_module.__state__ = await self._load_state(package_name)
-            raise e
-        finally:
-            if clean:
-                clean()
-
-    def _find_dependents(self, package_name: str) -> List[str]:
-        # 获取依赖模块的绝对路径
-        dependent_modules = list(tracker.imports.get(package_name, []))
-
-        # 添加被更新的模块本身
-        if package_name in sys.modules and hasattr(sys.modules[package_name], '__file__'):
-            dependent_modules.append(package_name)
-
-        # 返回所有依赖模块的文件夹目录
-        return [os.path.dirname(os.path.abspath(sys.modules[mod].__file__)) for mod in dependent_modules if mod in sys.modules and hasattr(sys.modules[mod], '__file__')]
-
-    async def _call_command_method(self, method: str, modules: List[str]) -> None:
-        # 收集所有需要调用的命令，防止迭代过程中字典改变
-        commands_to_call = []
-
-        for module in modules:
-            for command in Command_Dict.get(module, []):
-                if method == 'delete':
-                    commands_to_call.append(
-                        (command, method, {'script_folder_path': module}))
+        # 清理执行器
+        for func_key in list(executor.registered_functions.keys()):
+            if func_key[0].startswith(package_name):
+                task = executor.registered_functions.pop(func_key, None)
+                executor.on_end_functions.discard(task)
+                if asyncio.iscoroutinefunction(task.func):
+                    asyncio.run_coroutine_threadsafe(
+                        task.call(), self.loop).result()
                 else:
-                    commands_to_call.append((command, method, {}))
+                    asyncio.run_coroutine_threadsafe(
+                        asyncio.to_thread(task.call()), self.loop).result()
 
-        # 在单独的循环中调用收集到的命令
-        for command, method, kwargs in commands_to_call:
-            if method == 'delete':
-                await getattr(command, method)(**kwargs)
-            else:
-                await getattr(command, method)()
+    def _unload_modules(self, package_name: str):
+        """同步卸载模块"""
+        modules_to_unload = [
+            name for name in sys.modules
+            if name == package_name or name.startswith(f"{package_name}.")
+        ]
 
-    def _call_handler_method(self, method: str, modules: List[str]) -> None:
-        for module in modules:
-            for handler in Handler_Dict.get(module, []):
-                getattr(handler, f"{method}")()
-
-    def _unload_module(self, package_name: str) -> None:
-        modules_to_unload = [name for name in sys.modules if name ==
-                             package_name or name.startswith(package_name + '.')]
         for name in modules_to_unload:
             del sys.modules[name]
 
-    async def _load_module(self, package_name: str, package_path: str) -> None:
-        init_file = os.path.join(package_path, '__init__.py')
-        if not os.path.exists(init_file):
-            return
-
-        # 异步读取文件内容
-        async with aiofiles.open(init_file, mode='rb') as file:
-            content = await file.read()
-        content = content.replace(b'\x00', b'')
-
-        # 动态加载模块
-        spec = importlib.util.spec_from_file_location(package_name, init_file)
-        if spec is None or spec.loader is None:
-            raise ImportError(
-                f"Module {package_name} not found at {package_path}")
-
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[package_name] = module
+    async def _async_load_module(self, package_name: str) -> Optional[Any]:
+        """异步加载模块"""
+        init_file = Path(self.package_path) / "__init__.py"
+        if not init_file.exists():
+            return None
 
         try:
-            spec.loader.exec_module(module)
+            spec = importlib.util.spec_from_file_location(
+                package_name, init_file)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Invalid spec for {package_name}")
+
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[package_name] = module
+
+            await self.loop.run_in_executor(
+                reload_executor,
+                spec.loader.exec_module,
+                module
+            )
+
+            return module
         except SyntaxError as e:
-            logger.error(f"Syntax error while loading module {
-                         package_name}: {e}")
+            logger.error(f"Syntax error in {package_name}: {str(e)}")
             raise
+
         except Exception as e:
-            logger.error(f"Error while loading module {package_name}: {e}")
+            logger.error(f"Failed to load {package_name}: {str(e)}")
             raise
 
-    def on_any_event(self, event: FileSystemEvent) -> None:
-        if not event.is_directory and event.src_path.endswith('.py'):
-            # 检查是否在同一文件夹内
-            if self.current_event and os.path.dirname(event.src_path) == os.path.dirname(self.current_event.src_path):
-                return
+    async def _cleanup_commands(self, package_name: str):
+        """异步清理命令系统"""
+        dependent_modules = await self.loop.run_in_executor(
+            None,
+            self._find_dependents,
+            package_name
+        )
 
-            # 如果当前有任务在运行，忽略新事件
-            if self.reloading:
-                return
+        await self._call_command_method('delete', dependent_modules)
+        await self.loop.run_in_executor(
+            None,
+            self._call_handler_method,
+            'remove',
+            dependent_modules
+        )
 
-            # 更新当前事件
-            self.current_event = event
+    def _find_dependents(self, package_name: str) -> List[str]:
+        """查找依赖模块"""
+        return tracker._find_dependents(package_name)
 
-            # 取消之前的任务（如果有）
-            if self.event_task and not self.event_task.done():
-                self.event_task.cancel()
+    async def _call_command_method(self, method: str, modules: List[str]):
+        """异步调用命令方法"""
+        tasks = []
+        for module_path in modules:
+            for cmd in Command_Dict.get(module_path, []):
+                if method == 'delete':
+                    task = cmd.delete(script_folder_path=module_path)
+                else:
+                    task = getattr(cmd, method)()
+                tasks.append(asyncio.create_task(task))
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-            # 创建新的任务
-            self.event_task = asyncio.run_coroutine_threadsafe(
-                self._handle_event(event), self.loop)
-
-    async def _handle_event(self, event: FileSystemEvent) -> None:
-        try:
-            await self.reload_package(event)
-        except asyncio.CancelledError:
-            logger.debug(f"Event handling for {event.src_path} was cancelled")
-        finally:
-            # 清理当前事件
-            self.current_event = None
+    def _call_handler_method(self, method: str, modules: List[str]):
+        """调用处理器方法"""
+        for module_path in modules:
+            for handler in Handler_Dict.get(module_path, []):
+                getattr(handler, method)()
 
 
 class HotPlugin:
-    def __init__(self, loop: asyncio.AbstractEventLoop = None) -> None:
-        self.loop = loop
+    def __init__(self) -> None:
         self.observer = Observer()
-        self.reloader_map: Dict[str, AsyncReloader] = {}
-        self.task_queue: asyncio.Queue = asyncio.Queue()
-        self.running = False
-        self.pending_plugins: List[str] = []
+        self.reloaders: Dict[str, AsyncReloader] = {}
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self._running = False
+        self._pending_plugins: List[str] = []
+
+    def set_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """绑定到事件循环"""
+        self.loop = loop
+        # 处理等待中的插件
+        for path in self._pending_plugins:
+            self._add_reloader(path)
+        self._pending_plugins.clear()
 
     def add_plugin(self) -> None:
-        # 获取调用者模块的绝对路径
+        """添加当前调用者的插件"""
         caller_frame = inspect.stack()[1]
         caller_module = inspect.getmodule(caller_frame[0])
         if caller_module is None or not hasattr(caller_module, '__file__'):
-            raise ValueError("Could not determine the caller's module file.")
+            raise RuntimeError("无法确定调用模块路径")
 
-        caller_file = caller_module.__file__
-        if caller_file is None:
-            raise ValueError("Caller's module file is None.")
+        caller_path = Path(caller_module.__file__).parent
+        if not (caller_path / "__init__.py").exists():
+            raise ValueError(f"{caller_path} 不是有效的Python包")
 
-        package_path = os.path.dirname(caller_file)
-        if os.path.isfile(os.path.join(package_path, '__init__.py')):
-            self._add_plugin(package_path)
+        if self.loop is not None and self.loop.is_running():
+            self._add_reloader(str(caller_path))
         else:
-            raise ValueError(
-                f"The path {package_path} is not a valid package.")
+            self._pending_plugins.append(str(caller_path))
 
-    def _add_plugin(self, package_path: str) -> None:
-        if package_path not in self.reloader_map:
-            if self.loop:
-                # 如果有 loop，直接添加插件
-                reloader = AsyncReloader(
-                    package_path, self.task_queue, self.loop)
-                self.reloader_map[package_path] = reloader
-                self.observer.schedule(
-                    reloader, path=package_path, recursive=True)
-            else:
-                # 如果没有 loop，将插件路径加入到待处理列表
-                self.pending_plugins.append(package_path)
+    def _add_reloader(self, package_path: str) -> None:
+        """实际添加重载器"""
+        if package_path in self.reloaders:
+            return
+
+        if self.loop is None:
+            raise RuntimeError("事件循环未绑定")
+
+        reloader = AsyncReloader(package_path, self.loop)
+        self.reloaders[package_path] = reloader
+        self.observer.schedule(reloader, path=package_path, recursive=True)
+
+        # 启动事件处理任务
+        self.loop.create_task(reloader.process_events())
 
     def start(self) -> None:
-        if not self.running:
-            self.running = True
+        """启动热重载系统"""
+        if not self._running:
             self.observer.start()
-            if self.loop and self.loop.is_running():
-                self.loop.create_task(self._process_tasks())
+            self._running = True
 
-    async def _process_tasks(self) -> None:
-        while self.running:
-            func, args = await self.task_queue.get()
-            try:
-                if func:
-                    await func(*args)
-            finally:
-                self.task_queue.task_done()
+    async def stop(self) -> None:
+        """停止热重载系统"""
+        if self._running:
+            self.observer.stop()
+            await asyncio.to_thread(self.observer.join)
+            self._running = False
 
-    def set_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
-        self.loop = loop
-        if self.loop and self.loop.is_running():
-            # 处理堆积的插件任务
-            for package_path in self.pending_plugins:
-                self._add_plugin(package_path)
-            self.pending_plugins.clear()
-
-    def stop(self) -> None:
-        self.running = False
-        self.observer.stop()
-        self.observer.join()
-        if self.loop and self.loop.is_running():
-            self.loop.stop()
+            # 取消所有进行中的重载任务
+            for reloader in self.reloaders.values():
+                for task in reloader.pending_tasks:
+                    task.cancel()
+                await asyncio.gather(*reloader.pending_tasks, return_exceptions=True)
 
 
 HotSigner = HotPlugin()
+
 # 示例
 if __name__ == "__main__":
     loop = asyncio.new_event_loop()

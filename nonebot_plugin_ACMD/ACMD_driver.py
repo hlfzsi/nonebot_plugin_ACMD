@@ -29,13 +29,17 @@ class FunctionCall:
 
 class FunctionExecutor:
     __slots__ = ('pending_functions', 'process',
-                 'registered_functions', 'on_end_functions')
+                 'registered_functions', 'on_end_functions', 'loop')
 
     def __init__(self):
         self.pending_functions: Set[FunctionCall] = set()
         self.process = False
         self.registered_functions: Dict[Tuple[str, str], FunctionCall] = {}
         self.on_end_functions: Set[FunctionCall] = set()
+        self.loop = None
+
+    def _set_event_loop(self, loop: asyncio.AbstractEventLoop):
+        self.loop = loop
 
     def add_call(self, call: FunctionCall, is_on_end=False):
         if is_on_end:
@@ -50,11 +54,14 @@ class FunctionExecutor:
                 self.pending_functions.add(call)
             else:
                 if asyncio.iscoroutinefunction(call.func):
-                    asyncio.create_task(call.call())
+                    task = asyncio.run_coroutine_threadsafe(
+                        call.call(), self.loop)
                 else:
-                    asyncio.create_task(asyncio.to_thread(call.call))
+                    task = asyncio.create_task(asyncio.to_thread(call.call))
+                task.result()
 
-    async def trigger_execution(self) -> None:
+    async def trigger_execution(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._set_event_loop(loop)
         self.process = True
         tasks = []
         for call in self.pending_functions:
