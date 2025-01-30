@@ -18,7 +18,6 @@ pypinyin = "^0.53.0"
 prompt-toolkit = "^3.0.48"
 httpx = "^0.28.1"
 rapidfuzz = "^3.11.0"
-nonebot-plugin-localstore = "^0.7.3"
 
 
 [[tool.poetry.source]]

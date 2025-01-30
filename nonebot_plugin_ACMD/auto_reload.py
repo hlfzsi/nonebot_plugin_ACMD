@@ -10,28 +10,21 @@ import threading
 import importlib
 import importlib.util
 import inspect
-import pickle
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from collections import defaultdict
 
-import aiofiles
-import aiofiles.os
-from nonebot import logger, require
+from nonebot import logger
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
 from watchdog.observers import Observer
-from typing import Dict, Set, List, Optional, Final, Any, Coroutine
+from typing import Dict, Set, List, Optional, Final, Any
 
 from .ACMD_driver import executor
 from .command_signer import BasicHandler
 from .command import Command
 from .cli import CommandRegistry
 
-require("nonebot_plugin_localstore")
-from nonebot_plugin_localstore import get_cache_dir  # noqa
-
-STATE_DIR: Final[str] = str(get_cache_dir("nonebot_plugin_ACMD"))
 MAX_RELOAD_WORKERS: Final[int] = 4  # 最大并发重载工作线程数
 
 
@@ -90,7 +83,6 @@ class DependencyTracker:
         else:
             with self._lock:
                 self._add_dependency(fullname, caller)
-
         return None
 
     def _find_dependents(self, package_name: str) -> List[str]:
@@ -174,9 +166,6 @@ class AsyncReloader(FileSystemEventHandler):
             logger.success(f"Successfully reloaded package: {package_name}")
         except Exception as e:
             logger.error(f"Reload failed for {package_name}: {str(e)}")
-            # 回滚模块状态
-            if package_name in self.module_state_cache:
-                await self._restore_module_state(package_name)
 
     def on_any_event(self, event: FileSystemEvent) -> None:
         """主线程触发的同步事件处理"""
@@ -189,54 +178,6 @@ class AsyncReloader(FileSystemEventHandler):
     def _get_package_name(self) -> str:
         """获取标准化的包名称"""
         return Path(self.package_path).resolve().relative_to(Path.cwd()).as_posix().replace('/', '.')
-
-    async def _save_state(self, module_name: str) -> Coroutine[None, None, None]:
-        """异步保存模块状态"""
-        old_module = sys.modules.get(module_name)
-        if not old_module or not hasattr(old_module, '__state__'):
-            return
-
-        try:
-            # 使用线程池执行pickle序列化
-            state = await self.loop.run_in_executor(
-                reload_executor,
-                pickle.dumps,
-                old_module.__state__
-            )
-            state_file = Path(STATE_DIR) / f"{module_name}.state"
-
-            async with aiofiles.open(state_file, 'wb') as f:
-                await f.write(state)
-
-            self.module_state_cache[module_name] = state_file
-            logger.debug(f"Saved state for {module_name}")
-        except Exception as e:
-            logger.error(f"Failed to save state for {module_name}: {str(e)}")
-
-    async def _restore_module_state(self, module_name: str):
-        """恢复模块状态"""
-        state_file = self.module_state_cache.get(module_name)
-        if not state_file or not state_file.exists():
-            return
-
-        try:
-            async with aiofiles.open(state_file, 'rb') as f:
-                state_data = await f.read()
-
-            state = await self.loop.run_in_executor(
-                reload_executor,
-                pickle.loads,
-                state_data
-            )
-
-            if module := sys.modules.get(module_name):
-                module.__state__ = state
-                logger.debug(f"Restored state for {module_name}")
-        except Exception as e:
-            logger.error(f"Failed to restore state for {
-                         module_name}: {str(e)}")
-        finally:
-            await aiofiles.os.remove(state_file)
 
     async def _reload_module(self, package_name: str) -> None:
         """主重载逻辑"""
@@ -251,8 +192,6 @@ class AsyncReloader(FileSystemEventHandler):
         )
 
         try:
-            # 异步保存状态
-            await self._save_state(package_name)
 
             # 在线程池执行模块卸载
             await self.loop.run_in_executor(
@@ -262,11 +201,7 @@ class AsyncReloader(FileSystemEventHandler):
             )
 
             # 异步加载新模块
-            new_module = await self._async_load_module(package_name)
-
-            # 恢复状态
-            if new_module is not None:
-                await self._restore_module_state(package_name)
+            await self._async_load_module(package_name)
 
         except Exception as e:
             logger.error(f"Reload aborted due to error: {str(e)}")
@@ -296,7 +231,6 @@ class AsyncReloader(FileSystemEventHandler):
             name for name in sys.modules
             if name == package_name or name.startswith(f"{package_name}.")
         ]
-
         for name in modules_to_unload:
             del sys.modules[name]
 
