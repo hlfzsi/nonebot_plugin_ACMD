@@ -70,7 +70,7 @@ class CommandRegistry:
         return decorator
 
     @staticmethod
-    async def _noop_async_function(*args, **kwargs):
+    async def _noop_async_function():
         """占位符异步函数，用于替换被禁用的命令"""
         logger.warning('该命令被暂时禁用')
 

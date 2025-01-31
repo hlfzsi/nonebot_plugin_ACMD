@@ -99,4 +99,5 @@ async def total_stage(bot: Bot, event: MessageEvent):
 
 @driver.on_shutdown
 async def shut_up():
+    await HotSigner.stop()
     await ACMD_get_driver().trigger_on_end_execution()
