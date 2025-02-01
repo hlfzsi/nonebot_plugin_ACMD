@@ -8,10 +8,8 @@ from nonebot.adapters.onebot.v11 import Bot, MessageEvent
 from nonebot.rule import is_type
 from nonebot.plugin import PluginMetadata
 
-from .cli import App
 from .config import Config,config
 from .ACMD_driver import get_driver as ACMD_get_driver
-from .auto_reload import HotSigner
 from .command_signer import BasicHandler
 from .already_handler import func_to_Handler
 from .command import (
@@ -56,27 +54,6 @@ async def abcstart():
     await ACMD_get_driver().trigger_execution(asyncio.get_running_loop())
     HandlerContext.set_ready()
     Command._set_event_loop(asyncio.get_running_loop())
-    HotSigner.set_event_loop(asyncio.get_running_loop())
-    HotSigner.start()
-    app = App()
-
-    @CommandFactory.CLI_cmd_register('exit_cli')
-    async def _():
-        app.prompt_manager.stop()
-        await app.logger_handler.stop()
-        logger.info('已退出CLI')
-
-    @CommandFactory.CLI_cmd_register('Config_ACMD_SimilarityRate')
-    async def __(Similarity_Rate: float):
-        """临时修改相似度阈值
-
-        Args:
-            Similarity_Rate (float): 相似度阈值
-        """
-        config.Similarity_Rate = Similarity_Rate
-        logger.warning(f'本次运行时相似度阈值被设置为 {Similarity_Rate}')
-
-    app.run()
 
 
 @ACMD_Processor.handle()
@@ -99,5 +76,4 @@ async def total_stage(bot: Bot, event: MessageEvent):
 
 @driver.on_shutdown
 async def shut_up():
-    await HotSigner.stop()
     await ACMD_get_driver().trigger_on_end_execution()

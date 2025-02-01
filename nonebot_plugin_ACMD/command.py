@@ -16,7 +16,6 @@ from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, PrivateMessageEvent
 from .connection_pool import SQLitePool
 from .config import config
-from .cli import CommandRegistry
 from .command_signer import HandlerManager
 from .Atypes import HandlerInvoker, HandlerContext
 from .Atypes import (
@@ -292,23 +291,6 @@ class CommandFactory:
         HelpTakeOverManager.takeover_help(owner, help_text, function)
 
     @staticmethod
-    def CLI_cmd_register(cmd: str) -> Callable:
-        """
-        装饰器,用于注册控制台指令。
-
-        非常建议详细撰写被装饰函数的文档字符串,因为它会被展示给用户
-
-        参数:
-            cmd (str): 要注册的命令名称。
-        返回:
-            Callable: 一个装饰器，用来装饰实现命令逻辑的异步函数。
-        """
-        def decorator(func: Callable[..., Awaitable[None]]) -> Callable[..., Awaitable[None]]:
-            CommandRegistry.register(cmd)(func)
-            return func
-        return decorator
-
-    @staticmethod
     def parameter_injection(field: str, field_type: type):
         """
         装饰器用于设置依赖关系，确保可以被解析并由handler调用。
@@ -390,128 +372,170 @@ def _fuzzy_match_ratio(s1: str, s2: str) -> float:
     return fuzz.QRatio(trimmed_s1, s2)
 
 
+def _find_fuzzy_match_sync(commands: list, message_words: list) -> tuple:
+    """模糊匹配"""
+    max_similarity = 0.0
+    best_cmd = None
+    best_handlers = []
+    corrected_message = ''
+
+    for cmd, hlist, full_match in commands:
+        if not full_match:
+            expected_args = cmd.count(' ') + 1
+            if len(message_words) < expected_args:
+                continue
+
+            candidate = ' '.join(message_words[:expected_args])
+            current_sim = _fuzzy_match_ratio(candidate, cmd)
+        else:
+            candidate = ' '.join(message_words)
+            current_sim = _fuzzy_match_ratio(candidate, cmd)
+
+        if current_sim > max_similarity and current_sim >= config.Similarity_Rate:
+            max_similarity = current_sim
+            best_cmd = cmd
+            best_handlers = hlist.split(',')
+            corrected_message = ' '.join(
+                message_words).replace(candidate, cmd, 1).strip()
+        if current_sim == 1:
+            break
+        logger.debug(f'{candidate} 与 {cmd} 的相似度是 {current_sim}')
+
+    return (corrected_message, best_cmd, best_handlers, max_similarity) if best_cmd else ('', None, [], 0.0)
+
+
 async def dispatch(
     message: str,
     bot: Bot,
     event: Union[GroupMessageEvent, PrivateMessageEvent],
-    image: List[str] = [],
+    image: List[str] = None,
 ) -> None:
-    """消息派发，执行对应逻辑"""
+    """消息派发"""
 
-    groupid: str = str(getattr(event, 'group_id', -1))
     message = message.strip()
     if not message:
         return
+    if image is None:
+        image = []
 
-    async with COMMAND_POOL.connection() as conn:
-        cursor = await conn.cursor()
-        try:
-            if len(message) < 2:
-                await cursor.execute('SELECT command, handler_list FROM commands WHERE command = ?', (message,))
-            else:
-                prefix = message[:2]
-                await cursor.execute('SELECT command, handler_list, full_match FROM commands WHERE command = ? OR command LIKE ?', (message, f'{prefix}%'))
-            commands = await cursor.fetchall()
-        except Exception as e:
-            # 记录错误信息
-            logger.error(f"数据库操作失败: {e}")
-            raise
-        finally:
-            await cursor.close()
+    group_id = str(getattr(event, 'group_id', -1))
+    user_id = str(event.user_id)
+    message_words = message.split()
 
-    df_commands = pd.DataFrame(
-        commands, columns=['command', 'handler_list', 'full_match'])
-    best_match, best_match_handlers, exact_match, highest_similarity = '', [], False, 100.0
+    try:
+        async with COMMAND_POOL.connection() as conn:
+            async with conn.cursor() as cursor:
+                query, params = _build_query(message)
+                await cursor.execute(query, params)
+                commands = await cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Database operation failed: {e}")
+        return
 
-    # 检查完全匹配
-    exact_matches = df_commands[df_commands['command'] == message]
-    if not exact_matches.empty:
-        best_match: str = exact_matches.iloc[0]['command']
-        best_match_handlers = exact_matches.iloc[0]['handler_list'].split(',')
-        exact_match = True
-    else:
-        # 计算命令的空格数量
-        df_commands['command_spaces'] = df_commands['command'].str.count(' ')
+    # 处理命令匹配
+    best_match = None
+    handlers = []
+    similarity = 0.0
 
-        # 获取消息的前N个单词
-        message_split = message.split(' ')
+    # 第一优先级：完全匹配
+    exact_match = next((c for c in commands if c[0] == message), None)
+    if exact_match:
+        best_match, handlers = exact_match[0], exact_match[1].split(',')
 
-        # 查找非完全匹配命令
-        df_commands['message_n_plus_1_space_content'] = df_commands['command_spaces'].apply(
-            lambda spaces: ' '.join(
-                message_split[:spaces + 1]) if spaces + 1 <= len(message_split) else ''
+    # 第二优先级：参数式匹配
+    if not best_match:
+        param_match = next(
+            (c for c in commands
+             if not c[2] and c[0] == ' '.join(message_words[:c[0].count(' ')+1])),
+            None
+        )
+        if param_match:
+            best_match, handlers = param_match[0], param_match[1].split(',')
+
+    # 第三优先级：模糊匹配
+    if not best_match:
+        message, best_match, handlers, similarity = await asyncio.to_thread(_find_fuzzy_match_sync,
+                                                                            commands, message_words)
+        logger.debug(f'最好的匹配 {best_match}')
+
+    # 创建上下文
+    ctx = _create_context(
+        message=message,
+        best_match=best_match,
+        similarity=similarity,
+        handlers=handlers,
+        image=image,
+        event=event,
+        bot=bot,
+        group_id=group_id,
+        user_id=user_id
+    )
+
+    try:
+        if best_match:
+            await _execute_handlers(handlers, ctx)
+    finally:
+        await _execute_unconditional_handlers(ctx)
+
+
+def _create_context(**kwargs) -> HandlerContext:
+    """创建处理上下文"""
+    msg_content: str = kwargs['message']
+    if kwargs['best_match']:
+        msg_content = msg_content.replace(kwargs['best_match'], '', 1).strip()
+
+    return HandlerContext(
+        msg=UserInput(
+            msg_content,
+            kwargs['message'],
+            kwargs['best_match'] or ''
+        ),
+        image=ImageInput(kwargs['image']),
+        pin=PIN(kwargs['user_id'], kwargs['event'].avatar),
+        groupid=GroupID(kwargs['group_id'], int(kwargs['group_id'])),
+        bot=kwargs['bot'],
+        event=kwargs['event'],
+        record=Record(
+            similarity=kwargs['similarity'],
+            handlers=kwargs['handlers']
+        )
+    )
+
+
+async def _execute_handlers(handlers: list, ctx: HandlerContext):
+    """执行命令处理器"""
+    logger.debug('Executing command handlers...')
+    for handler_id in handlers:
+        await HandlerInvoker.invoke_handler(int(handler_id), ctx)
+
+
+async def _execute_unconditional_handlers(ctx: HandlerContext):
+    """执行全量处理器"""
+    logger.debug('Executing unconditional handlers...')
+    for handler in HandlerManager._Unconditional_Handler:
+        await HandlerInvoker.invoke_handler(
+            handler,
+            ctx,
+            False
         )
 
-        matches = df_commands[(~df_commands['full_match']) & (
-            df_commands['command'] == df_commands['message_n_plus_1_space_content'])]
-        if not matches.empty:
-            best_match: str = matches.iloc[0]['command']
-            best_match_handlers = matches.iloc[0]['handler_list'].split(',')
-            exact_match = True
 
-        # 计算相似度
-        if not df_commands.empty and not exact_match:
-            df_commands['similarity'] = df_commands.apply(
-                lambda row: _fuzzy_match_ratio(
-                    row['message_n_plus_1_space_content'], row['command'])
-                if row['command_spaces'] + 1 <= len(message_split) else 0.0, axis=1
-            )
+def _build_query(message: str) -> tuple:
+    """构建SQL查询"""
+    if len(message) < 2:
+        return (
+            'SELECT command, handler_list, full_match '
+            'FROM commands WHERE command = ?',
+            (message,)
+        )
 
-            # 找到相似度最高的行
-            max_similarity = df_commands['similarity'].max()
-            best_match_rows = df_commands[df_commands['similarity']
-                                          == max_similarity]
-            if len(best_match_rows) == 1 and max_similarity >= config.Similarity_Rate:
-                best_match_row = best_match_rows.iloc[0]
-                best_match: str = best_match_row['command']
-                best_match_handlers = best_match_row['handler_list'].split(',')
-                highest_similarity = best_match_row['similarity']
-                logger.debug(f"相似度最高的命令是：{best_match_rows.iloc[0]['command']}, 相似度为：{
-                             max_similarity}")
-            else:
-                logger.debug(f"相似度最高的命令是：{best_match_rows.iloc[0]['command']}, 相似度为：{
-                             max_similarity}")
-                return
-
-    # 确保字符数差异符合要求
-    if best_match:
-        command_full_match = df_commands[df_commands['command']
-                                         == best_match]['full_match'].iloc[0]
-        if command_full_match and abs(len(message) - len(best_match)) >= 3:
-            return
-
-        # 替换消息内容
-        if not exact_match:
-            message_parts = message.split(' ')
-            command_spaces = best_match.count(' ')
-            if command_spaces + 1 <= len(message_parts):
-                message_parts[:command_spaces + 1] = best_match.split(' ')
-                message = ' '.join(message_parts)
-
-    best_match_handlers = [int(handle_id) for handle_id in best_match_handlers]
-
-    # 继续执行处理程序.首先运行命令，然后运行全量
-    handler_context = None
-    try:
-        if best_match or HandlerManager._Unconditional_Handler:
-            handler_context = HandlerContext(
-                msg=UserInput(message.replace(
-                    best_match, '', 1).strip(), message, best_match),
-                image=ImageInput(image),
-                pin=PIN(str(event.user_id), event.avatar),
-                groupid=GroupID(groupid, int(groupid)),
-                bot=bot,
-                event=event,
-                record=Record(similarity=highest_similarity,
-                              handlers=best_match_handlers)
-            )
-        if best_match:
-            for handler in best_match_handlers:
-                await HandlerInvoker.invoke_handler(handler, handler_context)
-    finally:
-        if handler_context:
-            for handler in HandlerManager._Unconditional_Handler:
-                await HandlerInvoker.invoke_handler(handler, handler_context, rasie_StopPropagation=False)
+    prefix = message[:2]
+    return (
+        'SELECT command, handler_list, full_match '
+        'FROM commands WHERE command = ? OR command LIKE ? '
+        'ORDER BY LENGTH(command) DESC',
+        (message, f'{prefix}%')
+    )
 
 
 class Helper(BasicHandler):
