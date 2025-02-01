@@ -9,7 +9,6 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = "^3.10"
 aiosqlite = "^0.20.0"
-pandas = "^2.2.3"
 watchdog = "^6.0.0"
 nonebot2 = "^2.4.1"
 nonebot-adapter-onebot = "^2.4.6"

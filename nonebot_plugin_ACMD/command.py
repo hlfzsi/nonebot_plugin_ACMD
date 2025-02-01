@@ -8,9 +8,8 @@ import asyncio
 
 import sqlite3
 import aiosqlite
-import pandas as pd
 from rapidfuzz import fuzz
-from typing import Awaitable, List, Union, Any, Dict, Callable, Final, Optional
+from typing import List, Union, Any, Dict, Callable, Final, Optional
 
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, PrivateMessageEvent
