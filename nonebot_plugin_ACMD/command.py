@@ -396,11 +396,11 @@ def _find_fuzzy_match_sync(commands: list, message_words: list) -> tuple:
             best_handlers = hlist.split(',')
             corrected_message = ' '.join(
                 message_words).replace(candidate, cmd, 1).strip()
-        if current_sim == 1:
-            break
         logger.debug(f'{candidate} 与 {cmd} 的相似度是 {current_sim}')
+        if current_sim - 1 >= 0:
+            break
 
-    return (corrected_message, best_cmd, best_handlers, max_similarity) if best_cmd else ('', None, [], 0.0)
+    return (corrected_message, best_cmd, best_handlers, max_similarity) if best_cmd else (' '.join(message_words), None, [], 0.0)
 
 
 async def dispatch(

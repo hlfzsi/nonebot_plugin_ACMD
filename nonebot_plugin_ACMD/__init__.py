@@ -8,7 +8,7 @@ from nonebot.adapters.onebot.v11 import Bot, MessageEvent
 from nonebot.rule import is_type
 from nonebot.plugin import PluginMetadata
 
-from .config import Config,config
+from .config import Config
 from .ACMD_driver import get_driver as ACMD_get_driver
 from .command_signer import BasicHandler
 from .already_handler import func_to_Handler
