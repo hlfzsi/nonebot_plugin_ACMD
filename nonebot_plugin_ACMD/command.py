@@ -390,7 +390,7 @@ def _find_fuzzy_match_sync(commands: list, message_words: list) -> tuple:
             candidate = ' '.join(message_words)
             current_sim = _fuzzy_match_ratio(candidate, cmd)
 
-        if current_sim > max_similarity and current_sim >= config.Similarity_Rate:
+        if current_sim > max_similarity and current_sim >= config.similarity_rate:
             max_similarity = current_sim
             best_cmd = cmd
             best_handlers = hlist.split(',')
