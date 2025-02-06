@@ -412,8 +412,6 @@ async def dispatch(
     """消息派发"""
 
     message = message.strip()
-    if not message:
-        return
     if image is None:
         image = []
 

@@ -178,7 +178,7 @@ class ImageInput:
                 if return_byte:
                     return index, response.content
                 else:
-                    file_extension = os.path.splitext(url)[1]
+                    file_extension = os.path.splitext(url)[1] or '.jpg'
                     base_filename = f"{image_name}_{
                         index}" if image_name else f"{hash(url)}"
                     filename = os.path.join(
