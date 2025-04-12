@@ -488,7 +488,7 @@ def _create_context(**kwargs) -> HandlerContext:
             kwargs['best_match'] or ''
         ),
         image=ImageInput(kwargs['image']),
-        pin=PIN(kwargs['user_id'], kwargs['event'].avatar),
+        pin=PIN(kwargs['user_id'], getattr(kwargs['event'],"avatar") or f"https://q1.qlogo.cn/g?b=qq&nk={kwargs['user_id']}&s=640"),
         groupid=GroupID(kwargs['group_id'], int(kwargs['group_id'])),
         bot=kwargs['bot'],
         event=kwargs['event'],
